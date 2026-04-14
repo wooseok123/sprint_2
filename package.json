@@ -1,0 +1,14 @@
+{
+  "name": "dxf-boundary-detection",
+  "version": "1.0.0",
+  "description": "DXF Outer Boundary Detection with Overlay",
+  "scripts": {
+    "server": "cd backend && source .venv/bin/activate && uvicorn main:app --reload --port 8000",
+    "client": "cd dxf-viewer && npm run dev",
+    "dev": "npm run server & npm run client",
+    "install:all": "cd backend && python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt && cd ../dxf-viewer && npm install"
+  },
+  "keywords": ["dxf", "boundary", "detection", "threejs"],
+  "author": "",
+  "license": "MIT"
+}
