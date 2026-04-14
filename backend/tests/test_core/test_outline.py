@@ -136,6 +136,22 @@ def test_outline_v2_preserves_courtyard_hole():
     assert Polygon(polygon.interiors[0]).area == pytest.approx(Polygon(courtyard_inner).area, rel=0.15)
 
 
+def test_outline_v2_fills_oversized_shell_hole():
+    shell = Polygon(
+        [(0, 0), (2000, 0), (2000, 1000), (0, 1000)],
+        holes=[
+            [(100, 100), (900, 100), (900, 900), (100, 900)],
+            [(1100, 100), (1800, 100), (1800, 900), (1100, 900)],
+        ],
+    )
+
+    polygon, metadata = OutlineExtractorV2()._assemble_footprint(shell)
+
+    assert polygon is not None
+    assert len(polygon.interiors) == 0
+    assert metadata["footprint_holes"] == 0
+
+
 def test_outline_v2_handles_l_shaped_double_wall():
     outer = [(0, 0), (420, 0), (420, 170), (170, 170), (170, 420), (0, 420)]
     segments = _build_noded_double_wall_l_shape()

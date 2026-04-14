@@ -8,6 +8,25 @@ import { detectBoundary } from '../services/boundaryApi'
 import './DxfViewer.css'
 
 const VIEW_PADDING = 0.08
+const DEFAULT_UNIT_SCALE_TO_MM = 1
+
+function transformBoundaryToViewerUnits(boundary, metadata) {
+  if (!boundary) {
+    return boundary
+  }
+
+  const scale = metadata?.unit_scale_to_mm ?? DEFAULT_UNIT_SCALE_TO_MM
+  if (!Number.isFinite(scale) || scale === 0 || scale === 1) {
+    return boundary
+  }
+
+  const rescaleRing = (ring) => ring.map(([x, y]) => [x / scale, y / scale])
+
+  return {
+    exterior: rescaleRing(boundary.exterior),
+    interiors: (boundary.interiors ?? []).map(rescaleRing)
+  }
+}
 
 function DxfViewerComponent({ dxfFile }) {
   const containerRef = useRef(null)
@@ -38,6 +57,21 @@ function DxfViewerComponent({ dxfFile }) {
     )
   }, [])
 
+  const applyLayerVisibility = useCallback((viewer) => {
+    const dxf = viewer?.GetDxf()
+    const layers = dxf?.tables?.layer?.layers
+
+    if (!layers) {
+      return
+    }
+
+    for (const layer of Object.values(layers)) {
+      if (layer?.visible === false) {
+        viewer.ShowLayer(layer.name, false)
+      }
+    }
+  }, [])
+
   useEffect(() => {
     if (!containerRef.current || !dxfFile) {
       return
@@ -48,7 +82,8 @@ function DxfViewerComponent({ dxfFile }) {
       autoResize: true,
       clearColor: new THREE.Color(0xffffff),
       antialias: true,
-      colorCorrection: true
+      colorCorrection: true,
+      suppressPaperSpace: true
     })
     viewerRef.current = viewer
 
@@ -58,6 +93,8 @@ function DxfViewerComponent({ dxfFile }) {
     // Subscribe to events first
     const onLoaded = () => {
       console.log('DXF loaded successfully')
+      applyLayerVisibility(viewer)
+
       // Get bounds after loading
       const fileBounds = viewer.GetBounds()
       console.log('Bounds:', fileBounds)
@@ -91,7 +128,7 @@ function DxfViewerComponent({ dxfFile }) {
       viewer.Unsubscribe('loaded', onLoaded)
       viewer.Destroy()
     }
-  }, [dxfFile, fitViewerToBounds])
+  }, [applyLayerVisibility, dxfFile, fitViewerToBounds])
 
   // Reset boundary data when file changes
   useEffect(() => {
@@ -113,7 +150,10 @@ function DxfViewerComponent({ dxfFile }) {
 
     try {
       const result = await detectBoundary(dxfFile)
-      setBoundaryData(result)  // Store full result, not just boundary
+      setBoundaryData({
+        ...result,
+        boundary: transformBoundaryToViewerUnits(result.boundary, result.metadata)
+      })
       console.log('Boundary detected:', result)
     } catch (err) {
       console.error('Boundary detection failed:', err)

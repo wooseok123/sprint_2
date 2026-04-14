@@ -21,6 +21,9 @@ class Metadata(BaseModel):
     """Processing metadata and statistics."""
     area: float = Field(..., description="Detected boundary area in square units")
     bbox_area: float = Field(..., description="Bounding box area")
+    units: Optional[str] = Field(None, description="Detected DXF drawing units")
+    insunits_code: Optional[int] = Field(None, description="Raw INSUNITS code from the DXF header")
+    unit_scale_to_mm: Optional[float] = Field(None, description="Scale factor applied to normalize geometry to millimeters")
     confidence: float = Field(
         ...,
         ge=0.0,

@@ -31,6 +31,7 @@ class OutlineExtractorV2:
         parallel_tolerance_deg: float = 10.0,
         concave_hull_ratio: float = 0.3,
         courtyard_hole_ratio: float = 0.08,
+        max_courtyard_hole_ratio: float = 0.2,
         max_courtyard_holes: int = 2,
     ):
         self.min_wall_thickness = min_wall_thickness
@@ -39,6 +40,7 @@ class OutlineExtractorV2:
         self.parallel_tolerance_deg = parallel_tolerance_deg
         self.concave_hull_ratio = concave_hull_ratio
         self.courtyard_hole_ratio = courtyard_hole_ratio
+        self.max_courtyard_hole_ratio = max_courtyard_hole_ratio
         self.max_courtyard_holes = max_courtyard_holes
 
     def extract_boundary(self, segments: List[Segment]) -> Tuple[Optional[Polygon], Dict]:
@@ -397,6 +399,8 @@ class OutlineExtractorV2:
 
         area_threshold = max(min_hole_area, shell_area * self.courtyard_hole_ratio)
         if hole.area < area_threshold:
+            return False
+        if hole.area > shell_area * self.max_courtyard_hole_ratio:
             return False
 
         min_x, min_y, max_x, max_y = hole.bounds
