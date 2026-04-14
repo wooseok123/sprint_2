@@ -30,7 +30,8 @@ class OutlineExtractorV2:
         orthogonal_tolerance_deg: float = 15.0,
         parallel_tolerance_deg: float = 10.0,
         concave_hull_ratio: float = 0.3,
-        courtyard_hole_ratio: float = 0.05,
+        courtyard_hole_ratio: float = 0.08,
+        max_courtyard_holes: int = 2,
     ):
         self.min_wall_thickness = min_wall_thickness
         self.max_wall_thickness = max_wall_thickness
@@ -38,6 +39,7 @@ class OutlineExtractorV2:
         self.parallel_tolerance_deg = parallel_tolerance_deg
         self.concave_hull_ratio = concave_hull_ratio
         self.courtyard_hole_ratio = courtyard_hole_ratio
+        self.max_courtyard_holes = max_courtyard_holes
 
     def extract_boundary(self, segments: List[Segment]) -> Tuple[Optional[Polygon], Dict]:
         """
@@ -339,8 +341,8 @@ class OutlineExtractorV2:
         shell_polygon = Polygon(shell.exterior)
         shell_area = shell_polygon.area
         min_hole_area = max((self.min_wall_thickness * 4.0) ** 2, 100.0)
+        retained_holes: List[Polygon] = []
 
-        holes = []
         shell_holes = sorted(
             (Polygon(interior) for interior in shell.interiors),
             key=lambda hole: hole.area,
@@ -350,8 +352,8 @@ class OutlineExtractorV2:
         # The largest interior on the outer shell is typically the occupied
         # floor space inside the exterior walls, so we fill it by default.
         for hole in shell_holes[1:]:
-            if hole.area >= min_hole_area:
-                holes.append(list(hole.exterior.coords))
+            if self._is_courtyard_candidate(hole, shell_area, min_hole_area):
+                retained_holes.append(hole)
 
         for polygon in polygons:
             if polygon is shell or not shell_polygon.covers(polygon):
@@ -359,8 +361,14 @@ class OutlineExtractorV2:
 
             for interior in polygon.interiors:
                 hole = Polygon(interior)
-                if hole.area >= max(min_hole_area, shell_area * self.courtyard_hole_ratio):
-                    holes.append(list(interior.coords))
+                if self._is_courtyard_candidate(hole, shell_area, min_hole_area):
+                    retained_holes.append(hole)
+
+        retained_holes = sorted(retained_holes, key=lambda hole: hole.area, reverse=True)
+        if self.max_courtyard_holes > 0:
+            retained_holes = retained_holes[:self.max_courtyard_holes]
+
+        holes = [list(hole.exterior.coords) for hole in retained_holes]
 
         footprint = Polygon(shell.exterior.coords, holes)
         if footprint.is_empty:
@@ -377,6 +385,32 @@ class OutlineExtractorV2:
             "footprint_parts": len(polygons),
             "footprint_holes": len(holes),
         }
+
+    def _is_courtyard_candidate(
+        self,
+        hole: Polygon,
+        shell_area: float,
+        min_hole_area: float,
+    ) -> bool:
+        if hole.is_empty or not hole.is_valid:
+            return False
+
+        area_threshold = max(min_hole_area, shell_area * self.courtyard_hole_ratio)
+        if hole.area < area_threshold:
+            return False
+
+        min_x, min_y, max_x, max_y = hole.bounds
+        width = max_x - min_x
+        height = max_y - min_y
+        if min(width, height) < self.min_wall_thickness * 12.0:
+            return False
+
+        hull = hole.convex_hull
+        if hull.is_empty or hull.area == 0:
+            return False
+
+        compactness = hole.area / hull.area
+        return compactness >= 0.55
 
     def _segment_angle(self, segment: Segment) -> float:
         dy = segment.end.y - segment.start.y

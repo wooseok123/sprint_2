@@ -180,6 +180,7 @@ function DxfViewerComponent({ dxfFile }) {
           viewer={viewerRef.current}
           boundary={boundaryData.boundary}
           visible={overlayVisible}
+          showInteriors={false}
           colors={{ exterior: '#0B1F5C', interior: '#0B1F5C' }}
         />
       )}

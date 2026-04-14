@@ -8,6 +8,7 @@ function BoundaryOverlay({
   viewer,
   boundary,
   visible = true,
+  showInteriors = false,
   colors = { exterior: '#0b1f5c', interior: '#0b1f5c' }
 }) {
   const overlayGroupRef = useRef(null)
@@ -91,10 +92,12 @@ function BoundaryOverlay({
       overlayGroup.add(exteriorLine)
     }
 
-    for (const interior of boundary.interiors ?? []) {
-      const interiorLine = buildLine(interior, colors.interior, 0.8)
-      if (interiorLine) {
-        overlayGroup.add(interiorLine)
+    if (showInteriors) {
+      for (const interior of boundary.interiors ?? []) {
+        const interiorLine = buildLine(interior, colors.interior, 0.8)
+        if (interiorLine) {
+          overlayGroup.add(interiorLine)
+        }
       }
     }
 
@@ -118,7 +121,7 @@ function BoundaryOverlay({
       overlayGroupRef.current = null
       viewer.Render()
     }
-  }, [boundary, colors.exterior, colors.interior, viewer])
+  }, [boundary, colors.exterior, colors.interior, showInteriors, viewer])
 
   useEffect(() => {
     if (!overlayGroupRef.current || !viewer) {
