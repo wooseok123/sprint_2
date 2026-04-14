@@ -274,7 +274,16 @@ async def detect_boundary(file: UploadFile = File(...)):
                 processing_time_ms=processing_time_ms,
                 entity_count=parsed.entity_count,
                 node_count=graph_metrics.node_count,
-                edge_count=graph_metrics.edge_count
+                edge_count=graph_metrics.edge_count,
+                processing_details={
+                    "endpoint_extension": graph_processor.extension_metadata,
+                    "graph_pruning": {
+                        "pruned_edges": graph_metrics.pruned_edges,
+                        "pruned_percent": round(graph_metrics.pruned_percent, 3),
+                        "components": graph_metrics.components,
+                        "max_degree": graph_metrics.max_degree,
+                    },
+                },
             )
 
             # Prepare boundary data

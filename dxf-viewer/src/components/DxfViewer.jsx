@@ -28,6 +28,44 @@ function transformBoundaryToViewerUnits(boundary, metadata) {
   }
 }
 
+function transformExtensionHighlightsToViewerUnits(metadata) {
+  const extensions = metadata?.processing_details?.endpoint_extension?.applied_extensions
+
+  if (!Array.isArray(extensions) || extensions.length === 0) {
+    return []
+  }
+
+  const scale = metadata?.unit_scale_to_mm ?? DEFAULT_UNIT_SCALE_TO_MM
+  const normalizePoint = (point) => {
+    if (!Array.isArray(point) || point.length < 2) {
+      return null
+    }
+
+    if (!Number.isFinite(scale) || scale === 0 || scale === 1) {
+      return [point[0], point[1]]
+    }
+
+    return [point[0] / scale, point[1] / scale]
+  }
+
+  return extensions
+    .map((item) => {
+      const fromPoint = normalizePoint(item.from_point)
+      const toPoint = normalizePoint(item.to_point)
+
+      if (!fromPoint || !toPoint) {
+        return null
+      }
+
+      return {
+        ...item,
+        fromPoint,
+        toPoint
+      }
+    })
+    .filter(Boolean)
+}
+
 function DxfViewerComponent({ dxfFile }) {
   const containerRef = useRef(null)
   const viewerRef = useRef(null)
@@ -206,7 +244,8 @@ function DxfViewerComponent({ dxfFile }) {
       const result = await detectBoundary(dxfFile)
       setBoundaryData({
         ...result,
-        boundary: transformBoundaryToViewerUnits(result.boundary, result.metadata)
+        boundary: transformBoundaryToViewerUnits(result.boundary, result.metadata),
+        extensionHighlights: transformExtensionHighlightsToViewerUnits(result.metadata)
       })
       console.log('Boundary detected:', result)
     } catch (err) {
@@ -284,9 +323,10 @@ function DxfViewerComponent({ dxfFile }) {
         <BoundaryOverlay
           viewer={viewerRef.current}
           boundary={boundaryData.boundary}
+          extensionHighlights={boundaryData.extensionHighlights}
           visible={overlayVisible}
           showInteriors={false}
-          colors={{ exterior: '#0B3EA8', interior: '#0B3EA8' }}
+          colors={{ exterior: '#0B3EA8', interior: '#0B3EA8', extension: '#FF7A00' }}
         />
       )}
 

@@ -146,7 +146,8 @@ class TestBoundaryPipelineIntegration:
                 "bbox_area_unit",
                 "confidence",
                 "processing_time_ms",
-                "exterior_vertex_count"
+                "exterior_vertex_count",
+                "processing_details",
             ]
 
             for field in required_fields:
@@ -161,6 +162,8 @@ class TestBoundaryPipelineIntegration:
             assert isinstance(metadata["confidence"], (int, float))
             assert isinstance(metadata["processing_time_ms"], (int, float))
             assert isinstance(metadata["exterior_vertex_count"], int)
+            assert isinstance(metadata["processing_details"], dict)
+            assert "endpoint_extension" in metadata["processing_details"]
         else:
             # If not successful, that's ok for this test - we're just checking structure
             assert "success" in data

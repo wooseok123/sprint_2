@@ -4,6 +4,7 @@ Implements ezdxf parsing, recursive block explosion, and segment normalization
 """
 import math
 import logging
+import re
 from typing import List, Dict, Tuple, Any, Optional, Set
 from dataclasses import dataclass
 
@@ -88,6 +89,12 @@ class DXFParser:
     MAX_WALL_THICKNESS_MM = 300.0
     BREAKLINE_NAME_KEYWORDS = ('break', 'brk', '파단', '절단')
     ANNOTATION_LAYER_KEYWORDS = ('sym', 'anno')
+    ANNOTATION_NAME_TOKENS = (
+        'anno', 'annotation', 'sym', 'symbol', 'dim', 'dims', 'dimension',
+        'center', 'centre', 'centerline', 'cen', 'ctr', 'cntr', 'text', 'note',
+    )
+    ANNOTATION_LINETYPE_PREFIXES = ('center', 'centre', 'dim')
+    DIMENSION_BLOCK_PREFIXES = ('*d',)
 
     def __init__(self, filepath: str):
         """
@@ -205,6 +212,9 @@ class DXFParser:
         if self._is_breakline_entity(entity, transform=transform):
             return [], []
 
+        if self._is_annotation_entity(entity):
+            return [], []
+
         if dxftype == 'HATCH':
             return [], self._process_hatch(entity, transform)
 
@@ -235,7 +245,11 @@ class DXFParser:
 
     def _should_collect_entity(self, entity: DXFEntity) -> bool:
         """Return True when the entity should contribute to boundary parsing."""
-        return self._is_entity_renderable(entity) and not self._is_breakline_entity(entity)
+        return (
+            self._is_entity_renderable(entity)
+            and not self._is_breakline_entity(entity)
+            and not self._is_annotation_entity(entity)
+        )
 
     def _is_breakline_entity(
         self,
@@ -280,6 +294,84 @@ class DXFParser:
 
         normalized = str(name).strip().lower()
         return any(keyword in normalized for keyword in self.ANNOTATION_LAYER_KEYWORDS)
+
+    def _is_annotation_entity(self, entity: DXFEntity) -> bool:
+        """
+        Exclude common annotation-style geometry such as dimension and center lines.
+
+        We keep this narrower than a blanket layer filter by only excluding open
+        geometry, or whole INSERTs whose layer/block metadata clearly indicates
+        annotation content.
+        """
+        layer_name = getattr(entity.dxf, 'layer', None)
+        linetype_name = getattr(entity.dxf, 'linetype', None)
+
+        if entity.dxftype() == 'INSERT':
+            block_name = getattr(entity.dxf, 'name', None)
+            return (
+                self._matches_dimension_block_name(block_name)
+                or self._matches_annotation_name(layer_name)
+                or self._matches_annotation_name(block_name)
+                or self._matches_annotation_linetype_name(linetype_name)
+            )
+
+        if not self._is_open_annotation_geometry(entity):
+            return False
+
+        return (
+            self._matches_annotation_name(layer_name)
+            or self._matches_annotation_linetype_name(linetype_name)
+        )
+
+    def _is_open_annotation_geometry(self, entity: DXFEntity) -> bool:
+        """Return True for open entities that commonly represent annotation marks."""
+        dxftype = entity.dxftype()
+        if dxftype in {'LINE', 'ARC', 'SPLINE'}:
+            return True
+        if dxftype in {'LWPOLYLINE', 'POLYLINE'}:
+            return not self._polyline_is_closed(entity)
+        return False
+
+    def _matches_dimension_block_name(self, name: Optional[str]) -> bool:
+        """Match anonymous and named dimension blocks."""
+        if not name:
+            return False
+
+        normalized = str(name).strip().lower()
+        if any(normalized.startswith(prefix) for prefix in self.DIMENSION_BLOCK_PREFIXES):
+            return True
+        return self._matches_annotation_name(normalized)
+
+    def _matches_annotation_name(self, name: Optional[str]) -> bool:
+        """Match common dimension/centerline/annotation names by token."""
+        if not name:
+            return False
+
+        tokens = self._tokenize_name(name)
+        return any(token in self.ANNOTATION_NAME_TOKENS for token in tokens)
+
+    def _matches_annotation_linetype_name(self, name: Optional[str]) -> bool:
+        """Match common annotation linetypes such as CENTER2 and DIM."""
+        if not name:
+            return False
+
+        tokens = self._tokenize_name(name)
+        if not tokens:
+            return False
+
+        for token in tokens:
+            if token in self.ANNOTATION_NAME_TOKENS:
+                return True
+            if any(token.startswith(prefix) for prefix in self.ANNOTATION_LINETYPE_PREFIXES):
+                return True
+        return False
+
+    def _tokenize_name(self, name: Optional[str]) -> List[str]:
+        """Tokenize layer/block/linetype names for conservative keyword matching."""
+        if not name:
+            return []
+        normalized = str(name).strip().lower()
+        return [token for token in re.split(r'[^0-9a-z가-힣]+', normalized) if token]
 
     def _looks_like_breakline_polyline(
         self,

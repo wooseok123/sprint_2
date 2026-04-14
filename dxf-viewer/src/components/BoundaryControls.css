@@ -187,6 +187,134 @@
   border-top: 1px solid #e0e0e0;
 }
 
+.processing-panel {
+  margin-top: 12px;
+  padding: 12px;
+  border-radius: 8px;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+}
+
+.processing-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.processing-panel-header h5 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 700;
+  color: #1f2937;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.processing-badge {
+  padding: 4px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.processing-badge.active {
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+
+.processing-badge.idle {
+  background: #e5e7eb;
+  color: #4b5563;
+}
+
+.processing-summary-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.processing-summary-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px;
+  border-radius: 6px;
+  background: #f8fafc;
+}
+
+.processing-summary-label {
+  font-size: 10px;
+  font-weight: 700;
+  color: #64748b;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.processing-summary-value {
+  font-size: 13px;
+  font-weight: 600;
+  color: #0f172a;
+}
+
+.extension-list {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 240px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.extension-card {
+  padding: 10px;
+  border-radius: 8px;
+  background: linear-gradient(180deg, #eff6ff 0%, #f8fbff 100%);
+  border: 1px solid #bfdbfe;
+}
+
+.extension-card-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.extension-card-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: #1e3a8a;
+}
+
+.extension-card-length {
+  font-size: 12px;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.extension-card-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding-top: 4px;
+}
+
+.extension-card-label {
+  font-size: 11px;
+  color: #64748b;
+  font-weight: 600;
+}
+
+.extension-card-value {
+  font-size: 11px;
+  color: #0f172a;
+  font-family: 'Courier New', monospace;
+  text-align: right;
+}
+
 .processing-details summary {
   cursor: pointer;
   font-size: 12px;

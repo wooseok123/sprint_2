@@ -7,9 +7,10 @@ import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js'
 function BoundaryOverlay({
   viewer,
   boundary,
+  extensionHighlights = [],
   visible = true,
   showInteriors = false,
-  colors = { exterior: '#0b3ea8', interior: '#0b3ea8' }
+  colors = { exterior: '#0b3ea8', interior: '#0b3ea8', extension: '#ff7a00' }
 }) {
   const overlayGroupRef = useRef(null)
 
@@ -35,7 +36,7 @@ function BoundaryOverlay({
       overlayGroup.position.set(-origin.x, -origin.y, 0)
     }
 
-    const buildLine = (points, color, opacity) => {
+    const buildLine = (points, color, opacity, linewidth = 4.8) => {
       if (!points || points.length < 2) {
         return null
       }
@@ -66,7 +67,7 @@ function BoundaryOverlay({
         opacity,
         depthTest: false,
         depthWrite: false,
-        linewidth: 4.8
+        linewidth
       })
 
       fatLineMaterials.push(material)
@@ -101,6 +102,19 @@ function BoundaryOverlay({
       }
     }
 
+    for (const highlight of extensionHighlights) {
+      const extensionLine = buildLine(
+        [highlight.fromPoint, highlight.toPoint],
+        colors.extension,
+        0.95,
+        6.4
+      )
+
+      if (extensionLine) {
+        overlayGroup.add(extensionLine)
+      }
+    }
+
     scene.add(overlayGroup)
     overlayGroupRef.current = overlayGroup
     updateResolution()
@@ -121,7 +135,7 @@ function BoundaryOverlay({
       overlayGroupRef.current = null
       viewer.Render()
     }
-  }, [boundary, colors.exterior, colors.interior, showInteriors, viewer])
+  }, [boundary, colors.exterior, colors.extension, colors.interior, extensionHighlights, showInteriors, viewer])
 
   useEffect(() => {
     if (!overlayGroupRef.current || !viewer) {

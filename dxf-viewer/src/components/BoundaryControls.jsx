@@ -87,6 +87,23 @@ function BoundaryControls({
     return `${ms.toFixed(0)}ms`
   }
 
+  const formatDetailValue = (value) => {
+    if (value === null || value === undefined) return 'N/A'
+    if (typeof value === 'object') {
+      return JSON.stringify(value)
+    }
+    return String(value)
+  }
+
+  const formatPoint = (point) => {
+    if (!Array.isArray(point) || point.length < 2) return 'N/A'
+    return `(${formatNumber(point[0], 1)}, ${formatNumber(point[1], 1)})`
+  }
+
+  const endpointExtension = metadata?.processing_details?.endpoint_extension
+  const graphPruning = metadata?.processing_details?.graph_pruning
+  const extensionItems = endpointExtension?.applied_extensions ?? []
+
   return (
     <div className={`boundary-controls ${isExpanded ? 'expanded' : 'collapsed'}`}>
       <div className="controls-header" onClick={() => setIsExpanded(!isExpanded)}>
@@ -184,15 +201,102 @@ function BoundaryControls({
                 )}
               </div>
 
-              {/* Processing Details (if available) */}
+              {endpointExtension && (
+                <div className="processing-panel">
+                  <div className="processing-panel-header">
+                    <h5>Endpoint Extensions</h5>
+                    <span className={`processing-badge ${endpointExtension.applied_count > 0 ? 'active' : 'idle'}`}>
+                      {endpointExtension.applied_count > 0 ? `${endpointExtension.applied_count} applied` : 'No extensions'}
+                    </span>
+                  </div>
+                  <div className="processing-summary-grid">
+                    <div className="processing-summary-item">
+                      <span className="processing-summary-label">Attempted</span>
+                      <span className="processing-summary-value">{endpointExtension.attempted ? 'Yes' : 'No'}</span>
+                    </div>
+                    <div className="processing-summary-item">
+                      <span className="processing-summary-label">Base Length</span>
+                      <span className="processing-summary-value">{formatLength(endpointExtension.extension_length, 'mm')}</span>
+                    </div>
+                    <div className="processing-summary-item">
+                      <span className="processing-summary-label">Method</span>
+                      <span className="processing-summary-value">{endpointExtension.estimate_method || 'N/A'}</span>
+                    </div>
+                    <div className="processing-summary-item">
+                      <span className="processing-summary-label">Skipped</span>
+                      <span className="processing-summary-value">{endpointExtension.skipped_reason || 'No'}</span>
+                    </div>
+                  </div>
+
+                  {extensionItems.length > 0 && (
+                    <div className="extension-list">
+                      {extensionItems.map((item, index) => (
+                        <div key={`${item.source_segment_index}-${item.source_endpoint}-${index}`} className="extension-card">
+                          <div className="extension-card-top">
+                            <span className="extension-card-title">
+                              Seg #{item.source_segment_index} · {item.source_endpoint}
+                            </span>
+                            <span className="extension-card-length">
+                              +{formatLength(item.extension_mm, 'mm')}
+                            </span>
+                          </div>
+                          <div className="extension-card-row">
+                            <span className="extension-card-label">From</span>
+                            <span className="extension-card-value">{formatPoint(item.from_point)}</span>
+                          </div>
+                          <div className="extension-card-row">
+                            <span className="extension-card-label">To</span>
+                            <span className="extension-card-value">{formatPoint(item.to_point)}</span>
+                          </div>
+                          <div className="extension-card-row">
+                            <span className="extension-card-label">Target</span>
+                            <span className="extension-card-value">
+                              {item.target_kind}
+                              {item.target_segment_index !== undefined ? ` #${item.target_segment_index}` : ''}
+                            </span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {graphPruning && (
+                <div className="processing-panel">
+                  <div className="processing-panel-header">
+                    <h5>Graph Pruning</h5>
+                  </div>
+                  <div className="processing-summary-grid">
+                    <div className="processing-summary-item">
+                      <span className="processing-summary-label">Pruned Edges</span>
+                      <span className="processing-summary-value">{graphPruning.pruned_edges}</span>
+                    </div>
+                    <div className="processing-summary-item">
+                      <span className="processing-summary-label">Pruned %</span>
+                      <span className="processing-summary-value">{formatNumber(graphPruning.pruned_percent, 1)}%</span>
+                    </div>
+                    <div className="processing-summary-item">
+                      <span className="processing-summary-label">Components</span>
+                      <span className="processing-summary-value">{graphPruning.components}</span>
+                    </div>
+                    <div className="processing-summary-item">
+                      <span className="processing-summary-label">Max Degree</span>
+                      <span className="processing-summary-value">{graphPruning.max_degree}</span>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Raw Processing Details (if available) */}
               {metadata.processing_details && (
                 <details className="processing-details">
-                  <summary>Processing Details</summary>
+                  <summary>Raw Processing Details</summary>
                   <div className="details-content">
                     {Object.entries(metadata.processing_details).map(([key, value]) => (
                       <div key={key} className="detail-item">
                         <span className="detail-key">{key}:</span>
-                        <span className="detail-value">{String(value)}</span>
+                        <span className="detail-value">{formatDetailValue(value)}</span>
                       </div>
                     ))}
                   </div>

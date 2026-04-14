@@ -40,6 +40,7 @@ class Metadata(BaseModel):
     entity_count: Optional[int] = Field(None, ge=0, description="Total DXF entities processed")
     node_count: Optional[int] = Field(None, ge=0, description="Graph nodes after snapping")
     edge_count: Optional[int] = Field(None, ge=0, description="Graph edges after pruning")
+    processing_details: Optional[Dict[str, Any]] = Field(None, description="Additional structured processing diagnostics")
 
 
 class BoundaryResponse(BaseModel):

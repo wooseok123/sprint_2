@@ -175,6 +175,72 @@ class TestDXFParserInsertExpansion:
             "maxY": 0.0,
         }
 
+    def test_parse_skips_dimension_named_layers(self):
+        """Open geometry on common DIM layers should be ignored."""
+        doc = self._new_doc()
+        doc.layers.add("A-WAL")
+        doc.layers.add("A-DIM")
+
+        msp = doc.modelspace()
+        msp.add_line((0, 0), (100, 0), dxfattribs={"layer": "A-WAL"})
+        msp.add_line((40, -20), (40, 80), dxfattribs={"layer": "A-DIM"})
+
+        parsed = self._parse_document(doc)
+
+        assert parsed.entity_count == 1
+        assert len(parsed.segments) == 1
+        assert parsed.bbox == {
+            "minX": 0.0,
+            "minY": 0.0,
+            "maxX": 100.0,
+            "maxY": 0.0,
+        }
+
+    def test_parse_skips_centerline_linetype_lines(self):
+        """CENTER linetype should be treated as annotation-style linework."""
+        doc = self._new_doc()
+        doc.layers.add("A-WAL")
+
+        msp = doc.modelspace()
+        msp.add_line((0, 0), (100, 0), dxfattribs={"layer": "A-WAL"})
+        msp.add_line((50, -20), (50, 120), dxfattribs={"linetype": "CENTER"})
+
+        parsed = self._parse_document(doc)
+
+        assert parsed.entity_count == 1
+        assert len(parsed.segments) == 1
+        assert parsed.bbox == {
+            "minX": 0.0,
+            "minY": 0.0,
+            "maxX": 100.0,
+            "maxY": 0.0,
+        }
+
+    def test_parse_skips_annotation_insert_on_dimension_layer(self):
+        """INSERTs on DIM layers should suppress their block geometry."""
+        doc = self._new_doc()
+        doc.layers.add("A-WAL")
+        doc.layers.add("A-DIM")
+
+        detail = doc.blocks.new(name="DETAIL_MARK")
+        detail.add_line((0, 0), (0, 50))
+        detail.add_line((0, 50), (30, 50))
+
+        msp = doc.modelspace()
+        msp.add_line((0, 0), (100, 0), dxfattribs={"layer": "A-WAL"})
+        msp.add_blockref("DETAIL_MARK", (20, 20), dxfattribs={"layer": "A-DIM"})
+
+        parsed = self._parse_document(doc)
+
+        assert parsed.entity_count == 1
+        assert len(parsed.segments) == 1
+        assert parsed.bbox == {
+            "minX": 0.0,
+            "minY": 0.0,
+            "maxX": 100.0,
+            "maxY": 0.0,
+        }
+
     def test_parse_skips_invisible_entities(self):
         """Entities with the DXF invisible flag should be ignored."""
         doc = self._new_doc()

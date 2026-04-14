@@ -4,12 +4,15 @@ Implements tolerance snapping with KD-tree + Union-Find, and dangling edge pruni
 """
 import math
 import logging
-from typing import List, Dict, Tuple
+from statistics import median
+from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 
 import numpy as np
 from scipy.spatial import KDTree
 import networkx as nx
+from shapely.geometry import LineString, box
+from shapely.strtree import STRtree
 
 from core.parser import Segment, Point
 
@@ -49,15 +52,34 @@ class GraphProcessor:
                 }
         """
         self.bbox = bbox
-        self.adaptive_params = adaptive_params or {
+        default_params = {
             'tolerance_global_percent': 0.1,
             'tolerance_local_percent': 1.0,
             'min_tolerance_mm': 0.001,
-            'max_tolerance_mm': 1.0
+            'max_tolerance_mm': 1.0,
+            'endpoint_extension_ratio': 1.5,
+            'min_extension_mm': 25.0,
+            'max_extension_mm': 120.0,
+            'parallel_tolerance_deg': 12.0,
+            'orthogonal_tolerance_deg': 12.0,
+            'min_source_length_factor': 0.5,
+            'max_extension_passes': 4,
+            'corridor_padding_ratio': 0.15,
+            'max_extension_segments': 50000,
+            'max_extension_dangling_nodes': 4000,
         }
+        self.adaptive_params = {**default_params, **(adaptive_params or {})}
 
         self.tolerance = None
         self.graph = None
+        self.extension_metadata = {
+            "attempted": False,
+            "applied_count": 0,
+            "extension_length": 0.0,
+            "estimate_method": "uninitialized",
+            "skipped_reason": "",
+            "applied_extensions": [],
+        }
 
     def build_graph_and_snap(self, segments: List[Segment]) -> Tuple[nx.Graph, List[Segment]]:
         """
@@ -78,6 +100,21 @@ class GraphProcessor:
         # Apply tolerance snapping
         snapped_segments = self._apply_tolerance_snapping(segments)
         logger.info(f"Tolerance snapping: {len(segments)} → {len(snapped_segments)} segments")
+
+        # Apply short directional extensions for likely under-shot wall endpoints
+        snapped_segments = self._extend_dangling_endpoints(snapped_segments)
+        if self.extension_metadata["attempted"]:
+            logger.info(
+                "Directional endpoint extension: length=%.2f mm via %s, applied=%d",
+                self.extension_metadata["extension_length"],
+                self.extension_metadata["estimate_method"],
+                self.extension_metadata["applied_count"],
+            )
+        elif self.extension_metadata.get("skipped_reason"):
+            logger.info(
+                "Directional endpoint extension skipped: %s",
+                self.extension_metadata["skipped_reason"],
+            )
 
         # Build networkx graph
         self.graph = self._build_graph(snapped_segments)
@@ -243,6 +280,462 @@ class GraphProcessor:
 
         return tolerance
 
+    def _extend_dangling_endpoints(self, segments: List[Segment]) -> List[Segment]:
+        if not segments:
+            return []
+
+        extension_length, estimate_method = self._estimate_endpoint_extension_length(segments)
+        self.extension_metadata = {
+            "attempted": extension_length > 0,
+            "applied_count": 0,
+            "extension_length": extension_length,
+            "estimate_method": estimate_method,
+            "skipped_reason": "",
+            "applied_extensions": [],
+        }
+        if extension_length <= 0:
+            return segments
+
+        working_segments = list(segments)
+        if len(working_segments) > int(self.adaptive_params["max_extension_segments"]):
+            self.extension_metadata["attempted"] = False
+            self.extension_metadata["skipped_reason"] = "segment_count_exceeded"
+            return working_segments
+
+        initial_graph = self._build_graph(working_segments)
+        dangling_nodes = [node for node in initial_graph.nodes if initial_graph.degree(node) == 1]
+        if len(dangling_nodes) > int(self.adaptive_params["max_extension_dangling_nodes"]):
+            self.extension_metadata["attempted"] = False
+            self.extension_metadata["skipped_reason"] = "dangling_node_count_exceeded"
+            return working_segments
+
+        max_extension_passes = int(self.adaptive_params.get("max_extension_passes", 4))
+
+        for pass_index in range(max_extension_passes):
+            graph = initial_graph if pass_index == 0 else self._build_graph(working_segments)
+            extension_index = self._build_extension_index(graph, working_segments, extension_length)
+            candidates = []
+
+            for node in extension_index["dangling_nodes"]:
+                candidate = self._find_extension_candidate(
+                    graph,
+                    working_segments,
+                    node,
+                    extension_length,
+                    extension_index,
+                )
+                if candidate is None:
+                    continue
+
+                candidates.append(candidate)
+
+            if not candidates:
+                break
+
+            selected_candidates = self._select_batch_extension_candidates(candidates)
+            if not selected_candidates:
+                break
+
+            working_segments, applied_details = self._apply_extension_batch(
+                working_segments,
+                selected_candidates,
+            )
+            self.extension_metadata["applied_count"] += len(applied_details)
+            self.extension_metadata["applied_extensions"].extend(applied_details)
+
+        return working_segments
+
+    def _build_extension_index(
+        self,
+        graph: nx.Graph,
+        segments: List[Segment],
+        extension_length: float,
+    ) -> Dict:
+        nodes = list(graph.nodes)
+        node_array = np.array(nodes, dtype=float) if nodes else np.empty((0, 2), dtype=float)
+        endpoint_tree = KDTree(node_array) if len(node_array) else None
+
+        segment_lines = [
+            LineString([segment.start.to_2d(), segment.end.to_2d()])
+            for segment in segments
+        ]
+        segment_tree = STRtree(segment_lines) if segment_lines else None
+
+        corridor_padding = max(
+            self.tolerance * 4 if self.tolerance else 1.0,
+            extension_length * self.adaptive_params["corridor_padding_ratio"],
+        )
+
+        return {
+            "nodes": nodes,
+            "endpoint_tree": endpoint_tree,
+            "segment_tree": segment_tree,
+            "segment_lines": segment_lines,
+            "dangling_nodes": [node for node in nodes if graph.degree(node) == 1],
+            "corridor_padding": corridor_padding,
+        }
+
+    def _estimate_endpoint_extension_length(self, segments: List[Segment]) -> Tuple[float, str]:
+        wall_thickness, method = self._estimate_wall_thickness(segments)
+        extension = wall_thickness * self.adaptive_params["endpoint_extension_ratio"]
+        extension = max(extension, self.adaptive_params["min_extension_mm"])
+        extension = min(extension, self.adaptive_params["max_extension_mm"])
+        return extension, method
+
+    def _estimate_wall_thickness(self, segments: List[Segment]) -> Tuple[float, str]:
+        connector_lengths = self._estimate_from_orthogonal_connectors(segments)
+        if connector_lengths:
+            return self._clamp_wall_thickness(median(connector_lengths)), "orthogonal_connectors"
+
+        parallel_distances = self._estimate_from_parallel_pairs(segments)
+        if parallel_distances:
+            return self._clamp_wall_thickness(median(parallel_distances)), "parallel_pairs"
+
+        return self._estimate_from_bbox(segments), "bbox_fallback"
+
+    def _estimate_from_orthogonal_connectors(self, segments: List[Segment]) -> List[float]:
+        endpoint_map: Dict[Tuple[float, float], List[int]] = {}
+        for index, segment in enumerate(segments):
+            endpoint_map.setdefault(self._point_key(segment.start.to_2d()), []).append(index)
+            endpoint_map.setdefault(self._point_key(segment.end.to_2d()), []).append(index)
+
+        candidates: List[float] = []
+        for index, segment in enumerate(segments):
+            length = segment.length()
+            if not self._is_plausible_wall_thickness(length):
+                continue
+
+            start_neighbors = [
+                segments[neighbor]
+                for neighbor in endpoint_map[self._point_key(segment.start.to_2d())]
+                if neighbor != index
+            ]
+            end_neighbors = [
+                segments[neighbor]
+                for neighbor in endpoint_map[self._point_key(segment.end.to_2d())]
+                if neighbor != index
+            ]
+
+            if not start_neighbors or not end_neighbors:
+                continue
+
+            segment_angle = self._segment_angle(segment)
+            found_match = False
+            for start_neighbor in start_neighbors:
+                if start_neighbor.length() < length * 1.25:
+                    continue
+                if not self._is_orthogonal(segment_angle, self._segment_angle(start_neighbor)):
+                    continue
+
+                for end_neighbor in end_neighbors:
+                    if end_neighbor.length() < length * 1.25:
+                        continue
+                    end_angle = self._segment_angle(end_neighbor)
+                    if not self._is_orthogonal(segment_angle, end_angle):
+                        continue
+                    if not self._is_parallel(self._segment_angle(start_neighbor), end_angle):
+                        continue
+
+                    found_match = True
+                    break
+
+                if found_match:
+                    break
+
+            if found_match:
+                candidates.append(length)
+
+        return candidates
+
+    def _estimate_from_parallel_pairs(self, segments: List[Segment]) -> List[float]:
+        filtered = [segment for segment in segments if segment.length() > self.adaptive_params["min_extension_mm"]]
+        filtered.sort(key=lambda segment: segment.length(), reverse=True)
+        filtered = filtered[:200]
+
+        distances: List[float] = []
+        pair_budget = 6000
+        pair_count = 0
+
+        for left_index, left in enumerate(filtered):
+            left_angle = self._segment_angle(left)
+            left_axis = self._unit_vector(left)
+            left_normal = (-left_axis[1], left_axis[0])
+            left_mid = self._segment_midpoint(left)
+            left_interval = self._project_interval(left, left_axis)
+
+            for right in filtered[left_index + 1:]:
+                pair_count += 1
+                if pair_count > pair_budget:
+                    return distances
+
+                right_angle = self._segment_angle(right)
+                if not self._is_parallel(left_angle, right_angle):
+                    continue
+
+                right_interval = self._project_interval(right, left_axis)
+                overlap = self._interval_overlap(left_interval, right_interval)
+                if overlap < min(left.length(), right.length()) * 0.3:
+                    continue
+
+                right_mid = self._segment_midpoint(right)
+                distance = abs(
+                    (right_mid[0] - left_mid[0]) * left_normal[0]
+                    + (right_mid[1] - left_mid[1]) * left_normal[1]
+                )
+
+                if self._is_plausible_wall_thickness(distance):
+                    distances.append(distance)
+
+        return distances
+
+    def _estimate_from_bbox(self, segments: List[Segment]) -> float:
+        xs = [coord for segment in segments for coord in (segment.start.x, segment.end.x)]
+        ys = [coord for segment in segments for coord in (segment.start.y, segment.end.y)]
+        diagonal = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+        estimated = diagonal * 0.003
+        return self._clamp_wall_thickness(estimated)
+
+    def _find_extension_candidate(
+        self,
+        graph: nx.Graph,
+        segments: List[Segment],
+        node: Tuple[float, float],
+        extension_length: float,
+        extension_index: Dict,
+    ) -> Optional[Dict]:
+        neighbor = next(iter(graph.neighbors(node)))
+        edge_data = graph.get_edge_data(node, neighbor) or {}
+        segment_index = edge_data.get("index")
+        if segment_index is None:
+            return None
+
+        segment = segments[segment_index]
+        endpoint_name = "start" if self._point_key(segment.start.to_2d()) == self._point_key(node) else "end"
+        source_length = segment.length()
+        min_source_length = extension_length * self.adaptive_params["min_source_length_factor"]
+        if source_length < min_source_length:
+            return None
+
+        direction = self._extension_direction(segment, endpoint_name)
+        if direction is None:
+            return None
+
+        best_candidate = self._find_endpoint_candidate(
+            node,
+            direction,
+            extension_length,
+            extension_index,
+        )
+
+        segment_candidate = self._find_segment_candidate(
+            segments,
+            node,
+            segment_index,
+            direction,
+            extension_length,
+            extension_index,
+        )
+        if segment_candidate and (best_candidate is None or segment_candidate["distance"] < best_candidate["distance"]):
+            best_candidate = segment_candidate
+
+        if best_candidate is None:
+            return None
+
+        best_candidate["source_segment_index"] = segment_index
+        best_candidate["source_endpoint_name"] = endpoint_name
+        return best_candidate
+
+    def _find_endpoint_candidate(
+        self,
+        node: Tuple[float, float],
+        direction: Tuple[float, float],
+        extension_length: float,
+        extension_index: Dict,
+    ) -> Optional[Dict]:
+        endpoint_tree = extension_index["endpoint_tree"]
+        if endpoint_tree is None:
+            return None
+
+        best_candidate = None
+        candidate_indices = endpoint_tree.query_ball_point([node[0], node[1]], extension_length)
+
+        for candidate_index in candidate_indices:
+            other_node = extension_index["nodes"][candidate_index]
+            if other_node == node:
+                continue
+
+            distance, alignment = self._ray_distance_to_point(node, direction, other_node)
+            if distance is None or distance > extension_length:
+                continue
+            if alignment > self.adaptive_params["parallel_tolerance_deg"]:
+                continue
+
+            if best_candidate is None or distance < best_candidate["distance"]:
+                best_candidate = {
+                    "target_kind": "endpoint",
+                    "target_point": other_node,
+                    "distance": distance,
+                }
+
+        return best_candidate
+
+    def _find_segment_candidate(
+        self,
+        segments: List[Segment],
+        node: Tuple[float, float],
+        source_segment_index: int,
+        direction: Tuple[float, float],
+        extension_length: float,
+        extension_index: Dict,
+    ) -> Optional[Dict]:
+        segment_tree = extension_index["segment_tree"]
+        if segment_tree is None:
+            return None
+
+        best_candidate = None
+        corridor = self._extension_query_box(
+            node,
+            direction,
+            extension_length,
+            extension_index["corridor_padding"],
+        )
+        candidate_indices = segment_tree.query(corridor)
+
+        for target_index in candidate_indices:
+            if target_index == source_segment_index:
+                continue
+
+            target_segment = segments[int(target_index)]
+            target_angle = self._segment_angle(target_segment)
+            direction_angle = math.degrees(math.atan2(direction[1], direction[0]))
+            if not (
+                self._is_parallel(direction_angle, target_angle)
+                or self._is_orthogonal(direction_angle, target_angle)
+            ):
+                continue
+
+            intersection = self._ray_segment_intersection(
+                node,
+                direction,
+                target_segment,
+                extension_length,
+            )
+            if intersection is None:
+                continue
+
+            point, distance, split_target = intersection
+            if best_candidate is None or distance < best_candidate["distance"]:
+                best_candidate = {
+                    "target_kind": "segment",
+                    "target_point": point,
+                    "target_segment_index": int(target_index),
+                    "distance": distance,
+                    "split_target": split_target,
+                }
+
+        return best_candidate
+
+    def _select_batch_extension_candidates(self, candidates: List[Dict]) -> List[Dict]:
+        selected = []
+        used_sources = set()
+        used_segment_indices = set()
+        used_target_points = set()
+
+        for candidate in sorted(candidates, key=lambda item: item["distance"]):
+            source_key = (candidate["source_segment_index"], candidate["source_endpoint_name"])
+            if source_key in used_sources:
+                continue
+
+            target_point_key = self._point_key(candidate["target_point"])
+            if target_point_key in used_target_points:
+                continue
+
+            target_segment_index = candidate.get("target_segment_index")
+            involved_indices = {candidate["source_segment_index"]}
+            if target_segment_index is not None:
+                involved_indices.add(target_segment_index)
+
+            if involved_indices & used_segment_indices:
+                continue
+
+            selected.append(candidate)
+            used_sources.add(source_key)
+            used_target_points.add(target_point_key)
+            used_segment_indices.update(involved_indices)
+
+        return selected
+
+    def _apply_extension_batch(self, segments: List[Segment], candidates: List[Dict]) -> Tuple[List[Segment], List[Dict]]:
+        applied_details: List[Dict] = []
+        source_updates: Dict[int, Segment] = {}
+        target_splits: Dict[int, Tuple[Segment, Segment]] = {}
+
+        for candidate in candidates:
+            source_index = candidate["source_segment_index"]
+            original_segment = segments[source_index]
+            original_point = (
+                original_segment.start.to_2d()
+                if candidate["source_endpoint_name"] == "start"
+                else original_segment.end.to_2d()
+            )
+            target_point = Point(x=candidate["target_point"][0], y=candidate["target_point"][1])
+
+            if candidate["source_endpoint_name"] == "start":
+                source_updates[source_index] = Segment(
+                    start=target_point,
+                    end=original_segment.end,
+                    meta=original_segment.meta,
+                )
+            else:
+                source_updates[source_index] = Segment(
+                    start=original_segment.start,
+                    end=target_point,
+                    meta=original_segment.meta,
+                )
+
+            detail = {
+                "source_segment_index": source_index,
+                "source_endpoint": candidate["source_endpoint_name"],
+                "from_point": [float(original_point[0]), float(original_point[1])],
+                "to_point": [float(target_point.x), float(target_point.y)],
+                "extension_mm": round(self._distance(original_point, (target_point.x, target_point.y)), 3),
+                "target_kind": candidate["target_kind"],
+            }
+
+            if candidate["target_kind"] == "segment" and candidate.get("split_target"):
+                target_index = candidate["target_segment_index"]
+                target_segment = segments[target_index]
+                target_splits[target_index] = (
+                    Segment(target_segment.start, target_point, target_segment.meta),
+                    Segment(target_point, target_segment.end, target_segment.meta),
+                )
+                detail["target_segment_index"] = target_index
+            elif candidate["target_kind"] == "endpoint":
+                detail["target_point_index"] = [
+                    float(candidate["target_point"][0]),
+                    float(candidate["target_point"][1]),
+                ]
+
+            applied_details.append(detail)
+
+        updated_segments: List[Segment] = []
+        for index, segment in enumerate(segments):
+            if index in target_splits:
+                first, second = target_splits[index]
+                if first.length() > self.tolerance:
+                    updated_segments.append(first)
+                if second.length() > self.tolerance:
+                    updated_segments.append(second)
+                continue
+
+            if index in source_updates:
+                updated_segments.append(source_updates[index])
+                continue
+
+            updated_segments.append(segment)
+
+        return updated_segments, applied_details
+
     def _apply_tolerance_snapping(self, segments: List[Segment]) -> List[Segment]:
         """
         Apply tolerance snapping using KD-tree + Union-Find.
@@ -317,12 +810,12 @@ class GraphProcessor:
 
         for i, seg in enumerate(segments):
             # Find snapped start point
-            start_idx = endpoint_to_segment[i * 2][1] == 'start' and i * 2 or i * 2 + 1
+            start_idx = i * 2
             start_root = find(start_idx)
             snapped_start = representatives[start_root]
 
             # Find snapped end point
-            end_idx = endpoint_to_segment[i * 2 + 1][1] == 'end' and i * 2 + 1 or i * 2
+            end_idx = i * 2 + 1
             end_root = find(end_idx)
             snapped_end = representatives[end_root]
 
@@ -364,6 +857,161 @@ class GraphProcessor:
             )
 
         return graph
+
+    def _extension_direction(
+        self,
+        segment: Segment,
+        endpoint_name: str,
+    ) -> Optional[Tuple[float, float]]:
+        if endpoint_name == "start":
+            dx = segment.start.x - segment.end.x
+            dy = segment.start.y - segment.end.y
+        else:
+            dx = segment.end.x - segment.start.x
+            dy = segment.end.y - segment.start.y
+
+        length = math.hypot(dx, dy)
+        if length <= 1e-9:
+            return None
+        return (dx / length, dy / length)
+
+    def _ray_distance_to_point(
+        self,
+        origin: Tuple[float, float],
+        direction: Tuple[float, float],
+        point: Tuple[float, float],
+    ) -> Tuple[Optional[float], Optional[float]]:
+        vx = point[0] - origin[0]
+        vy = point[1] - origin[1]
+        distance = math.hypot(vx, vy)
+        if distance <= max(self.tolerance, 1e-9):
+            return None, None
+
+        target_direction = (vx / distance, vy / distance)
+        alignment = self._angle_between_vectors(direction, target_direction)
+        forward = vx * direction[0] + vy * direction[1]
+        if forward <= max(self.tolerance, 1e-9):
+            return None, None
+        return distance, alignment
+
+    def _ray_segment_intersection(
+        self,
+        origin: Tuple[float, float],
+        direction: Tuple[float, float],
+        segment: Segment,
+        max_distance: float,
+    ) -> Optional[Tuple[Tuple[float, float], float, bool]]:
+        p = np.array(origin, dtype=float)
+        r = np.array(direction, dtype=float)
+        q = np.array(segment.start.to_2d(), dtype=float)
+        s = np.array([
+            segment.end.x - segment.start.x,
+            segment.end.y - segment.start.y,
+        ], dtype=float)
+
+        cross_rs = self._cross_2d(r, s)
+        if abs(cross_rs) <= 1e-9:
+            return None
+
+        q_minus_p = q - p
+        t = self._cross_2d(q_minus_p, s) / cross_rs
+        u = self._cross_2d(q_minus_p, r) / cross_rs
+
+        if t <= max(self.tolerance, 1e-9) or t > max_distance:
+            return None
+        if u < -1e-9 or u > 1.0 + 1e-9:
+            return None
+
+        point = (origin[0] + direction[0] * t, origin[1] + direction[1] * t)
+        split_target = not (
+            self._distance(point, segment.start.to_2d()) <= self.tolerance
+            or self._distance(point, segment.end.to_2d()) <= self.tolerance
+        )
+        return point, float(t), split_target
+
+    def _extension_query_box(
+        self,
+        origin: Tuple[float, float],
+        direction: Tuple[float, float],
+        extension_length: float,
+        padding: float,
+    ):
+        end_x = origin[0] + direction[0] * extension_length
+        end_y = origin[1] + direction[1] * extension_length
+        min_x = min(origin[0], end_x) - padding
+        min_y = min(origin[1], end_y) - padding
+        max_x = max(origin[0], end_x) + padding
+        max_y = max(origin[1], end_y) + padding
+        return box(min_x, min_y, max_x, max_y)
+
+    def _segment_angle(self, segment: Segment) -> float:
+        return math.degrees(
+            math.atan2(segment.end.y - segment.start.y, segment.end.x - segment.start.x)
+        )
+
+    def _unit_vector(self, segment: Segment) -> Tuple[float, float]:
+        dx = segment.end.x - segment.start.x
+        dy = segment.end.y - segment.start.y
+        length = math.hypot(dx, dy)
+        if length <= 1e-9:
+            return (1.0, 0.0)
+        return (dx / length, dy / length)
+
+    def _segment_midpoint(self, segment: Segment) -> Tuple[float, float]:
+        return (
+            (segment.start.x + segment.end.x) * 0.5,
+            (segment.start.y + segment.end.y) * 0.5,
+        )
+
+    def _project_interval(self, segment: Segment, axis: Tuple[float, float]) -> Tuple[float, float]:
+        projections = [
+            segment.start.x * axis[0] + segment.start.y * axis[1],
+            segment.end.x * axis[0] + segment.end.y * axis[1],
+        ]
+        return min(projections), max(projections)
+
+    def _interval_overlap(
+        self,
+        left: Tuple[float, float],
+        right: Tuple[float, float],
+    ) -> float:
+        return max(0.0, min(left[1], right[1]) - max(left[0], right[0]))
+
+    def _angle_between_vectors(
+        self,
+        left: Tuple[float, float],
+        right: Tuple[float, float],
+    ) -> float:
+        dot = max(-1.0, min(1.0, left[0] * right[0] + left[1] * right[1]))
+        return math.degrees(math.acos(dot))
+
+    def _angle_delta(self, left_deg: float, right_deg: float) -> float:
+        delta = abs((left_deg - right_deg) % 180.0)
+        return min(delta, 180.0 - delta)
+
+    def _is_parallel(self, left_deg: float, right_deg: float) -> bool:
+        return self._angle_delta(left_deg, right_deg) <= self.adaptive_params["parallel_tolerance_deg"]
+
+    def _is_orthogonal(self, left_deg: float, right_deg: float) -> bool:
+        return abs(self._angle_delta(left_deg, right_deg) - 90.0) <= self.adaptive_params["orthogonal_tolerance_deg"]
+
+    def _is_plausible_wall_thickness(self, value: float) -> bool:
+        return self.adaptive_params["min_extension_mm"] * 0.2 <= value <= self.adaptive_params["max_extension_mm"] * 2.5
+
+    def _clamp_wall_thickness(self, value: float) -> float:
+        return max(
+            self.adaptive_params["min_extension_mm"],
+            min(self.adaptive_params["max_extension_mm"], value),
+        )
+
+    def _point_key(self, point: Tuple[float, float]) -> Tuple[float, float]:
+        return (round(point[0], 6), round(point[1], 6))
+
+    def _distance(self, left: Tuple[float, float], right: Tuple[float, float]) -> float:
+        return math.hypot(left[0] - right[0], left[1] - right[1])
+
+    def _cross_2d(self, left: np.ndarray, right: np.ndarray) -> float:
+        return float(left[0] * right[1] - left[1] * right[0])
 
     def validate_planarity(self) -> Tuple[bool, str]:
         """
