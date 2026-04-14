@@ -6,7 +6,7 @@ import logging
 from typing import List
 from shapely.geometry import LineString, MultiLineString
 
-from core.parser import Segment
+from core.parser import Point, Segment
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +71,7 @@ class NodingProcessor:
             return segments
 
         # Convert back to Segment format
-        noded_segments = self._linestrings_to_segments(noded_lines, segments)
+        noded_segments = self._linestrings_to_segments(noded_lines)
 
         logger.info(f"Noding complete: {len(segments)} → {len(noded_segments)} segments")
 
@@ -103,16 +103,15 @@ class NodingProcessor:
 
     def _linestrings_to_segments(
         self,
-        line_strings: List[LineString],
-        original_segments: List[Segment]
+        line_strings: List[LineString]
     ) -> List[Segment]:
         """
         Convert shapely LineString objects back to Segment objects.
-        Preserves metadata from original segments when possible.
+        Metadata remapping is intentionally skipped because downstream stages
+        do not require source-level metadata for noded segments.
 
         Args:
             line_strings: List of noded LineString objects
-            original_segments: Original segments for metadata reference
 
         Returns:
             List of Segment objects
@@ -131,62 +130,12 @@ class NodingProcessor:
             start_coord = coords[0]
             end_coord = coords[-1]
 
-            # Find closest original segment for metadata
-            # (This is a simple heuristic - could be improved with spatial index)
-            meta = self._find_metadata_for_segment(
-                start_coord, end_coord, original_segments
-            )
-
             segment = Segment(
-                start=type('Point', (), {'x': start_coord[0], 'y': start_coord[1]})(),
-                end=type('Point', (), {'x': end_coord[0], 'y': end_coord[1]})(),
-                meta=meta
+                start=Point(x=start_coord[0], y=start_coord[1]),
+                end=Point(x=end_coord[0], y=end_coord[1]),
+                meta={'type': 'noded_segment'}
             )
 
             segments.append(segment)
 
         return segments
-
-    def _find_metadata_for_segment(
-        self,
-        start_coord: tuple,
-        end_coord: tuple,
-        original_segments: List[Segment]
-    ) -> dict:
-        """
-        Find appropriate metadata for a noded segment from original segments.
-        Uses simple distance-based matching.
-
-        Args:
-            start_coord: (x, y) start coordinate
-            end_coord: (x, y) end coordinate
-            original_segments: Original segments with metadata
-
-        Returns:
-            Metadata dict (or default if no match found)
-        """
-        # Calculate midpoint of noded segment
-        mid_x = (start_coord[0] + end_coord[0]) / 2
-        mid_y = (start_coord[1] + end_coord[1]) / 2
-
-        # Find original segment with closest midpoint
-        best_match = None
-        best_distance = float('inf')
-
-        for orig_seg in original_segments:
-            # Calculate original segment midpoint
-            orig_mid_x = (orig_seg.start.x + orig_seg.end.x) / 2
-            orig_mid_y = (orig_seg.start.y + orig_seg.end.y) / 2
-
-            # Calculate distance
-            distance = ((mid_x - orig_mid_x) ** 2 + (mid_y - orig_mid_y) ** 2) ** 0.5
-
-            if distance < best_distance:
-                best_distance = distance
-                best_match = orig_seg.meta
-
-        # Return best match metadata or default
-        if best_match and best_distance < self.tolerance * 10:
-            return best_match
-        else:
-            return {'type': 'noded_segment'}
