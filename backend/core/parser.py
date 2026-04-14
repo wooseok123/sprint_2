@@ -134,6 +134,9 @@ class DXFParser:
         entity_count = 0
 
         for entity in msp:
+            if not self._is_entity_renderable(entity):
+                continue
+
             entity_count += 1
 
             try:
@@ -190,6 +193,9 @@ class DXFParser:
         dxftype = entity.dxftype()
         visited = visited or set()
 
+        if not self._is_entity_renderable(entity):
+            return [], []
+
         if dxftype == 'HATCH':
             return [], self._process_hatch(entity, transform)
 
@@ -200,6 +206,46 @@ class DXFParser:
             return self._process_entity(entity, transform), []
 
         return [], []
+
+    def _is_entity_renderable(self, entity: DXFEntity) -> bool:
+        """
+        Apply the same visibility rules used by the frontend DXF viewer.
+
+        This prevents backend geometry extraction from including entities that
+        AutoCAD/dxf-viewer would not render, such as entities on off/frozen
+        layers or entities marked invisible.
+        """
+        if bool(getattr(entity.dxf, 'invisible', 0)):
+            return False
+
+        if bool(getattr(entity.dxf, 'paperspace', 0)):
+            return False
+
+        layer_name = getattr(entity.dxf, 'layer', None)
+        return self._is_layer_renderable(layer_name)
+
+    def _is_layer_renderable(self, layer_name: Optional[str]) -> bool:
+        """
+        Match dxf-viewer's layer visibility behavior.
+
+        Layer "0" is treated specially for block content, so we do not suppress
+        it here based on layer flags alone.
+        """
+        if self.doc is None or layer_name in (None, '', '0'):
+            return True
+
+        try:
+            layer = self.doc.layers.get(layer_name)
+        except Exception:
+            logger.debug("Layer definition not found for '%s'; treating as visible", layer_name)
+            return True
+
+        color = getattr(layer.dxf, 'color', 7)
+        flags = getattr(layer.dxf, 'flags', 0)
+
+        is_off = color < 0
+        is_frozen = (flags & 1) != 0 or (flags & 2) != 0
+        return not is_off and not is_frozen
 
     def _process_insert(
         self,

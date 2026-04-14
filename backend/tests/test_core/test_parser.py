@@ -12,9 +12,14 @@ from core.parser import DXFParser
 class TestDXFParserInsertExpansion:
     """Parser tests focused on INSERT-heavy drawings."""
 
+    def _new_doc(self):
+        doc = ezdxf.new("R2010", setup=True)
+        doc.header["$INSUNITS"] = 4
+        return doc
+
     def test_parse_expands_modelspace_insert_with_geometry(self):
         """A drawing that only contains an INSERT should still yield segments."""
-        doc = ezdxf.new("R2010", setup=True)
+        doc = self._new_doc()
         rect_block = doc.blocks.new(name="RECT")
         rect_block.add_lwpolyline([(0, 0), (10, 0), (10, 20), (0, 20)], close=True)
 
@@ -34,7 +39,7 @@ class TestDXFParserInsertExpansion:
 
     def test_parse_expands_nested_insert_transforms(self):
         """Nested INSERT transforms should compose into final world coordinates."""
-        doc = ezdxf.new("R2010", setup=True)
+        doc = self._new_doc()
         line_block = doc.blocks.new(name="LINE_SEG")
         line_block.add_line((0, 0), (10, 0))
 
@@ -54,6 +59,91 @@ class TestDXFParserInsertExpansion:
         assert round(segment.start.y, 6) == 100.0
         assert round(segment.end.x, 6) == 105.0
         assert round(segment.end.y, 6) == 110.0
+
+    def test_parse_skips_entities_on_off_layers(self):
+        """Entities on layers hidden in CAD should be ignored by the backend too."""
+        doc = self._new_doc()
+        doc.layers.add("VISIBLE")
+        doc.layers.add("HIDDEN")
+        doc.layers.get("HIDDEN").off()
+
+        msp = doc.modelspace()
+        msp.add_line((0, 0), (10, 0), dxfattribs={"layer": "VISIBLE"})
+        msp.add_line((100, 100), (110, 100), dxfattribs={"layer": "HIDDEN"})
+
+        parsed = self._parse_document(doc)
+
+        assert parsed.entity_count == 1
+        assert len(parsed.segments) == 1
+        assert parsed.bbox == {
+            "minX": 0.0,
+            "minY": 0.0,
+            "maxX": 10.0,
+            "maxY": 0.0,
+        }
+
+    def test_parse_skips_entities_on_frozen_layers(self):
+        """Frozen layers should not contribute geometry to boundary detection."""
+        doc = self._new_doc()
+        doc.layers.add("VISIBLE")
+        doc.layers.add("FROZEN")
+        doc.layers.get("FROZEN").freeze()
+
+        msp = doc.modelspace()
+        msp.add_line((0, 0), (10, 0), dxfattribs={"layer": "VISIBLE"})
+        msp.add_line((100, 100), (110, 100), dxfattribs={"layer": "FROZEN"})
+
+        parsed = self._parse_document(doc)
+
+        assert parsed.entity_count == 1
+        assert len(parsed.segments) == 1
+        assert parsed.bbox == {
+            "minX": 0.0,
+            "minY": 0.0,
+            "maxX": 10.0,
+            "maxY": 0.0,
+        }
+
+    def test_parse_skips_blockrefs_on_off_layers(self):
+        """A hidden INSERT should suppress the entire referenced block geometry."""
+        doc = self._new_doc()
+        doc.layers.add("BLOCK_HIDDEN")
+        doc.layers.get("BLOCK_HIDDEN").off()
+
+        rect_block = doc.blocks.new(name="RECT")
+        rect_block.add_lwpolyline([(0, 0), (10, 0), (10, 20), (0, 20)], close=True)
+
+        msp = doc.modelspace()
+        msp.add_blockref("RECT", (100, 200), dxfattribs={"layer": "BLOCK_HIDDEN"})
+
+        parsed = self._parse_document(doc)
+
+        assert parsed.entity_count == 0
+        assert len(parsed.segments) == 0
+        assert parsed.bbox == {
+            "minX": 0,
+            "minY": 0,
+            "maxX": 0,
+            "maxY": 0,
+        }
+
+    def test_parse_skips_invisible_entities(self):
+        """Entities with the DXF invisible flag should be ignored."""
+        doc = self._new_doc()
+        msp = doc.modelspace()
+        hidden_line = msp.add_line((0, 0), (10, 0))
+        hidden_line.dxf.invisible = 1
+
+        parsed = self._parse_document(doc)
+
+        assert parsed.entity_count == 0
+        assert len(parsed.segments) == 0
+        assert parsed.bbox == {
+            "minX": 0,
+            "minY": 0,
+            "maxX": 0,
+            "maxY": 0,
+        }
 
     def _parse_document(self, doc):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".dxf", delete=False) as handle:
