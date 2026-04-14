@@ -28,6 +28,7 @@ from core.noding import NodingProcessor
 from core.graph import GraphProcessor
 from core.cycles import CycleDetector
 from core.filter import AreaFilter
+from core.outline import OutlineExtractorV2
 from core.union import BoundaryExtractor
 from core.validate import BoundaryValidator
 
@@ -132,24 +133,6 @@ async def detect_boundary(file: UploadFile = File(...)):
             )
             graph, snapped_segments = graph_processor.build_graph_and_snap(noded_segments)
 
-            # STEP 5: Cycle detection
-            logger.info("STEP 6: Detecting cycles...")
-            cycle_detector = CycleDetector(snapped_segments)
-            cycles = cycle_detector.detect_cycles()
-
-            logger.info(f"Detected {len(cycles)} cycles")
-
-            if not cycles:
-                return BoundaryResponse(
-                    success=False,
-                    boundary=None,
-                    metadata=None,
-                    error="No closed cycles detected. The DXF may not form a complete boundary."
-                )
-
-            # Standardize winding direction
-            cycles = cycle_detector.standardize_winding(cycles)
-
             # STEP 5 (auxiliary): prune only short dangling spurs for diagnostics
             logger.info("STEP 5: Pruning short dangling spurs...")
             graph_metrics = graph_processor.prune_dangling_edges(max_iterations=1000)
@@ -173,39 +156,65 @@ async def detect_boundary(file: UploadFile = File(...)):
                 # TODO: AI judgment integration (requires Gemini API key)
                 # For now, proceed with caution
 
-            # STEP 7: Area filtering
-            logger.info("STEP 7: Filtering by area...")
-            area_filter = AreaFilter(
-                bbox=parsed.bbox,
-                entity_count=parsed.entity_count,
-                adaptive_params={
-                    'min_area_percent': float(os.getenv("AREA_FILTER_MIN_PERCENT", "0.5")),
-                    'max_area_percent': float(os.getenv("AREA_FILTER_MAX_PERCENT", "2.0")),
-                    'entity_count_factor': 0.0001,
-                    'arc_density_factor': 0.1
-                }
-            )
+            use_v2 = os.getenv("BOUNDARY_EXTRACTOR_V2", "false").lower() == "true"
+            cycles = []
 
-            # Calculate ARC density for adaptive filtering
-            arc_segments = sum(1 for seg in parsed.segments if 'arc' in seg.meta.get('type', ''))
-            arc_density = arc_segments / len(parsed.segments) if parsed.segments else 0
+            if use_v2:
+                logger.info("STEP 6-8: Extracting outline with OutlineExtractorV2...")
+                outline_extractor = OutlineExtractorV2()
+                merged_polygon, merge_metadata = outline_extractor.extract_boundary(snapped_segments)
+            else:
+                # STEP 6: Cycle detection
+                logger.info("STEP 6: Detecting cycles...")
+                cycle_detector = CycleDetector(snapped_segments)
+                cycles = cycle_detector.detect_cycles()
 
-            valid_polygons = area_filter.filter_cycles(cycles, arc_density=arc_density)
+                logger.info(f"Detected {len(cycles)} cycles")
 
-            logger.info(f"Area filter: {len(cycles)} → {len(valid_polygons)} valid polygons")
+                if not cycles:
+                    return BoundaryResponse(
+                        success=False,
+                        boundary=None,
+                        metadata=None,
+                        error="No closed cycles detected. The DXF may not form a complete boundary."
+                    )
 
-            if not valid_polygons:
-                return BoundaryResponse(
-                    success=False,
-                    boundary=None,
-                    metadata=None,
-                    error="No polygons passed area filter. The detected cycles may be too small."
+                # Standardize winding direction
+                cycles = cycle_detector.standardize_winding(cycles)
+
+                # STEP 7: Area filtering
+                logger.info("STEP 7: Filtering by area...")
+                area_filter = AreaFilter(
+                    bbox=parsed.bbox,
+                    entity_count=parsed.entity_count,
+                    adaptive_params={
+                        'min_area_percent': float(os.getenv("AREA_FILTER_MIN_PERCENT", "0.5")),
+                        'max_area_percent': float(os.getenv("AREA_FILTER_MAX_PERCENT", "2.0")),
+                        'entity_count_factor': 0.0001,
+                        'arc_density_factor': 0.1
+                    }
                 )
 
-            # STEP 8: Unary union + boundary extraction
-            logger.info("STEP 8: Extracting boundary...")
-            boundary_extractor = BoundaryExtractor()
-            merged_polygon, merge_metadata = boundary_extractor.extract_boundary(valid_polygons)
+                # Calculate ARC density for adaptive filtering
+                arc_segments = sum(1 for seg in parsed.segments if 'arc' in seg.meta.get('type', ''))
+                arc_density = arc_segments / len(parsed.segments) if parsed.segments else 0
+
+                valid_polygons = area_filter.filter_cycles(cycles, arc_density=arc_density)
+
+                logger.info(f"Area filter: {len(cycles)} → {len(valid_polygons)} valid polygons")
+
+                if not valid_polygons:
+                    return BoundaryResponse(
+                        success=False,
+                        boundary=None,
+                        metadata=None,
+                        error="No polygons passed area filter. The detected cycles may be too small."
+                    )
+
+                # STEP 8: Unary union + boundary extraction
+                logger.info("STEP 8: Extracting boundary...")
+                boundary_extractor = BoundaryExtractor()
+                merged_polygon, merge_metadata = boundary_extractor.extract_boundary(valid_polygons)
 
             if merged_polygon is None:
                 return BoundaryResponse(
