@@ -37,6 +37,7 @@ function DxfViewerComponent({ dxfFile }) {
   const [boundaryData, setBoundaryData] = useState(null)
   const [isDetecting, setIsDetecting] = useState(false)
   const [error, setError] = useState(null)
+  const [drawingVisible, setDrawingVisible] = useState(true)
   const [overlayVisible, setOverlayVisible] = useState(true)
 
   const fitViewerToBounds = useCallback((viewer, nextBounds) => {
@@ -72,6 +73,49 @@ function DxfViewerComponent({ dxfFile }) {
     }
   }, [])
 
+  const applyDrawingVisibility = useCallback((viewer, showDrawing) => {
+    const dxf = viewer?.GetDxf()
+    const scene = viewer?.GetScene()
+    const layers = dxf?.tables?.layer?.layers
+    const isOverlayObject = (object) => {
+      let current = object
+      while (current) {
+        if (current.name === 'boundary-overlay') {
+          return true
+        }
+        current = current.parent
+      }
+      return false
+    }
+
+    if (viewer?.layers instanceof Map && layers) {
+      for (const layer of viewer.layers.values()) {
+        const layerDefinition = layers[layer.name]
+        const shouldShow = showDrawing && layerDefinition?.visible !== false
+        for (const obj of layer.objects) {
+          obj.visible = shouldShow
+        }
+      }
+      viewer.Render()
+      return
+    }
+
+    if (!scene) {
+      return
+    }
+
+    scene.traverse((object) => {
+      if (!object.parent || isOverlayObject(object)) {
+        return
+      }
+      if (object.isScene || object.isCamera || object.isLight) {
+        return
+      }
+      object.visible = showDrawing
+    })
+    viewer.Render()
+  }, [])
+
   useEffect(() => {
     if (!containerRef.current || !dxfFile) {
       return
@@ -105,6 +149,7 @@ function DxfViewerComponent({ dxfFile }) {
         requestAnimationFrame(() => {
           requestAnimationFrame(() => {
             fitViewerToBounds(viewer, fileBounds)
+            applyDrawingVisibility(viewer, true)
             viewer.Render()
           })
         })
@@ -128,13 +173,22 @@ function DxfViewerComponent({ dxfFile }) {
       viewer.Unsubscribe('loaded', onLoaded)
       viewer.Destroy()
     }
-  }, [applyLayerVisibility, dxfFile, fitViewerToBounds])
+  }, [applyDrawingVisibility, applyLayerVisibility, dxfFile, fitViewerToBounds])
 
   // Reset boundary data when file changes
   useEffect(() => {
     setBoundaryData(null)
     setError(null)
+    setDrawingVisible(true)
+    setOverlayVisible(true)
   }, [dxfFile])
+
+  useEffect(() => {
+    if (!viewerRef.current) {
+      return
+    }
+    applyDrawingVisibility(viewerRef.current, drawingVisible)
+  }, [applyDrawingVisibility, drawingVisible])
 
   const handleResetView = () => {
     if (viewerRef.current && bounds) {
@@ -167,9 +221,15 @@ function DxfViewerComponent({ dxfFile }) {
     setOverlayVisible(prev => !prev)
   }, [])
 
+  const handleToggleDrawing = useCallback(() => {
+    setDrawingVisible(prev => !prev)
+  }, [])
+
   const handleClearBoundary = useCallback(() => {
     setBoundaryData(null)
     setError(null)
+    setDrawingVisible(true)
+    setOverlayVisible(true)
   }, [])
 
   return (
@@ -181,6 +241,9 @@ function DxfViewerComponent({ dxfFile }) {
         isDetecting={isDetecting}
         metadata={boundaryData ? {
           area: boundaryData.metadata?.area,
+          area_unit: boundaryData.metadata?.area_unit,
+          perimeter: boundaryData.metadata?.perimeter,
+          perimeter_unit: boundaryData.metadata?.perimeter_unit,
           confidence: boundaryData.metadata?.confidence,
           exterior_vertex_count: boundaryData.metadata?.exterior_vertex_count,
           interior_hole_count: boundaryData.boundary?.interiors?.length || 0,
@@ -191,7 +254,9 @@ function DxfViewerComponent({ dxfFile }) {
         } : null}
         error={error}
         hasBoundary={!!boundaryData}
+        drawingVisible={drawingVisible}
         overlayVisible={overlayVisible}
+        onToggleDrawing={handleToggleDrawing}
         onToggleOverlay={handleToggleOverlay}
         onClear={handleClearBoundary}
       />
@@ -221,7 +286,7 @@ function DxfViewerComponent({ dxfFile }) {
           boundary={boundaryData.boundary}
           visible={overlayVisible}
           showInteriors={false}
-          colors={{ exterior: '#0B1F5C', interior: '#0B1F5C' }}
+          colors={{ exterior: '#0B3EA8', interior: '#0B3EA8' }}
         />
       )}
 

@@ -9,7 +9,7 @@ function BoundaryOverlay({
   boundary,
   visible = true,
   showInteriors = false,
-  colors = { exterior: '#0b1f5c', interior: '#0b1f5c' }
+  colors = { exterior: '#0b3ea8', interior: '#0b3ea8' }
 }) {
   const overlayGroupRef = useRef(null)
 
@@ -66,7 +66,7 @@ function BoundaryOverlay({
         opacity,
         depthTest: false,
         depthWrite: false,
-        linewidth: 3.5
+        linewidth: 4.8
       })
 
       fatLineMaterials.push(material)

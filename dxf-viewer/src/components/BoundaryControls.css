@@ -60,6 +60,7 @@
 }
 
 .detect-button,
+.toggle-drawing-button,
 .toggle-overlay-button,
 .clear-button {
   padding: 10px 16px;
@@ -89,6 +90,16 @@
 .toggle-overlay-button {
   background: #4caf50;
   color: white;
+}
+
+.toggle-drawing-button {
+  background: #0b3ea8;
+  color: white;
+}
+
+.toggle-drawing-button:hover {
+  background: #082f7f;
+  transform: translateY(-1px);
 }
 
 .toggle-overlay-button:hover {

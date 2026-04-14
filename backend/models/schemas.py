@@ -20,7 +20,12 @@ class BoundaryData(BaseModel):
 class Metadata(BaseModel):
     """Processing metadata and statistics."""
     area: float = Field(..., description="Detected boundary area in square units")
+    area_unit: str = Field(..., description="Unit for area values, typically mm² after normalization")
+    perimeter: float = Field(..., description="Exterior boundary perimeter length")
+    perimeter_unit: str = Field(..., description="Unit for perimeter values, typically mm after normalization")
     bbox_area: float = Field(..., description="Bounding box area")
+    bbox_area_unit: str = Field(..., description="Unit for bbox area values, typically mm² after normalization")
+    exterior_vertex_count: int = Field(..., ge=0, description="Number of vertices in the exterior boundary ring")
     units: Optional[str] = Field(None, description="Detected DXF drawing units")
     insunits_code: Optional[int] = Field(None, description="Raw INSUNITS code from the DXF header")
     unit_scale_to_mm: Optional[float] = Field(None, description="Scale factor applied to normalize geometry to millimeters")

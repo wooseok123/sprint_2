@@ -140,6 +140,10 @@ class TestBoundaryPipelineIntegration:
             # Check required metadata fields
             required_fields = [
                 "area",
+                "area_unit",
+                "perimeter",
+                "perimeter_unit",
+                "bbox_area_unit",
                 "confidence",
                 "processing_time_ms",
                 "exterior_vertex_count"
@@ -150,6 +154,10 @@ class TestBoundaryPipelineIntegration:
 
             # Validate types
             assert isinstance(metadata["area"], (int, float))
+            assert metadata["area_unit"] == "mm²"
+            assert isinstance(metadata["perimeter"], (int, float))
+            assert metadata["perimeter_unit"] == "mm"
+            assert metadata["bbox_area_unit"] == "mm²"
             assert isinstance(metadata["confidence"], (int, float))
             assert isinstance(metadata["processing_time_ms"], (int, float))
             assert isinstance(metadata["exterior_vertex_count"], int)

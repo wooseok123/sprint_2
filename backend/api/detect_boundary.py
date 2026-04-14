@@ -260,7 +260,12 @@ async def detect_boundary(file: UploadFile = File(...)):
             # Prepare metadata
             metadata = Metadata(
                 area=validation_result.metadata['area'],
+                area_unit="mm²",
+                perimeter=validation_result.metadata['perimeter'],
+                perimeter_unit="mm",
                 bbox_area=bbox_area,
+                bbox_area_unit="mm²",
+                exterior_vertex_count=len(validation_result.exterior_coords),
                 units=parsed.units,
                 insunits_code=parsed.insunits_code,
                 unit_scale_to_mm=parsed.unit_scale_to_mm,
