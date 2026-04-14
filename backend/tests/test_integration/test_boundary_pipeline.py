@@ -81,6 +81,20 @@ class TestBoundaryPipelineIntegration:
         assert "success" in data
         assert "boundary" in data or "error" in data
 
+    def test_pipeline_with_outline_v2_feature_flag(self, monkeypatch):
+        """Test V2 outline extraction on open outer walls plus a closed inner room."""
+        monkeypatch.setenv("BOUNDARY_EXTRACTOR_V2", "true")
+        dxf_content = self._create_open_double_wall_with_inner_room_dxf()
+
+        files = {"file": ("outline_v2.dxf", io.BytesIO(dxf_content), "application/dxf")}
+        response = client.post("/api/detect-boundary", files=files)
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["boundary"]["exterior"]
+        assert data["metadata"]["area"] > 500000
+
     def test_pipeline_error_handling_empty_dxf(self):
         """Test error handling with empty DXF file."""
         dxf_content = b""
@@ -201,6 +215,61 @@ class TestBoundaryPipelineIntegration:
         # Add inner rectangle (hole)
         inner_points = [(250, 250), (750, 250), (750, 750), (250, 750)]
         msp.add_lwpolyline(inner_points, close=True)
+
+        doc.header['$INSUNITS'] = 4
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.dxf', delete=False) as f:
+            temp_path = f.name
+            doc.write(f)
+
+        with open(temp_path, 'rb') as f:
+            content = f.read()
+
+        os.unlink(temp_path)
+        return content
+
+    def _create_open_double_wall_with_inner_room_dxf(self) -> bytes:
+        """Create a DXF with an open outer shell and a closed interior room."""
+        doc = ezdxf.new('R2010', setup=True)
+        msp = doc.modelspace()
+
+        def add_segment(start, end):
+            msp.add_line(start, end)
+
+        def add_ring(points, gap_edge=None, gap_size=0.0):
+            for index, start in enumerate(points):
+                end = points[(index + 1) % len(points)]
+                if gap_edge != index or gap_size <= 0:
+                    add_segment(start, end)
+                    continue
+
+                x1, y1 = start
+                x2, y2 = end
+                if x1 == x2:
+                    mid = (y1 + y2) / 2.0
+                    add_segment(start, (x1, mid - gap_size / 2.0))
+                    add_segment((x1, mid + gap_size / 2.0), end)
+                else:
+                    mid = (x1 + x2) / 2.0
+                    add_segment(start, (mid - gap_size / 2.0, y1))
+                    add_segment((mid + gap_size / 2.0, y1), end)
+
+        outer = [
+            (0, 0), (500, 0), (1000, 0), (1000, 300),
+            (1000, 600), (500, 600), (0, 600), (0, 300),
+        ]
+        inner = [
+            (40, 40), (500, 40), (960, 40), (960, 300),
+            (960, 560), (500, 560), (40, 560), (40, 300),
+        ]
+
+        add_ring(outer, gap_edge=5, gap_size=30.0)
+        add_ring(inner, gap_edge=5, gap_size=30.0)
+        for index in (1, 3, 5, 7):
+            add_segment(outer[index], inner[index])
+
+        room = [(300, 180), (450, 180), (450, 330), (300, 330)]
+        add_ring(room)
 
         doc.header['$INSUNITS'] = 4
 
