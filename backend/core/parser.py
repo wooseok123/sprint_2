@@ -84,6 +84,10 @@ class DXFParser:
     # NOTE: CIRCLE is EXCLUDED per plan (causes noise, rare for outer walls)
     TARGET_ENTITY_TYPES = {'LINE', 'LWPOLYLINE', 'POLYLINE', 'SPLINE', 'ARC', 'INSERT'}
     BLOCK_REFERENCE_TYPES = {'INSERT'}
+    MIN_WALL_THICKNESS_MM = 5.0
+    MAX_WALL_THICKNESS_MM = 300.0
+    BREAKLINE_NAME_KEYWORDS = ('break', 'brk', '파단', '절단')
+    ANNOTATION_LAYER_KEYWORDS = ('sym', 'anno')
 
     def __init__(self, filepath: str):
         """
@@ -96,6 +100,7 @@ class DXFParser:
         self.doc: Optional[ezdxf.document.Drawing] = None
         self.insunits_code = 0
         self.unit_scale_to_mm = 1.0
+        self._arc_group_counter = 0
 
     def parse(self) -> ParsedDXF:
         """
@@ -126,6 +131,7 @@ class DXFParser:
         )
 
         # Collect all segments
+        self._arc_group_counter = 0
         segments = []
         hatch_entities = []
 
@@ -134,7 +140,7 @@ class DXFParser:
         entity_count = 0
 
         for entity in msp:
-            if not self._is_entity_renderable(entity):
+            if not self._should_collect_entity(entity):
                 continue
 
             entity_count += 1
@@ -196,6 +202,9 @@ class DXFParser:
         if not self._is_entity_renderable(entity):
             return [], []
 
+        if self._is_breakline_entity(entity, transform=transform):
+            return [], []
+
         if dxftype == 'HATCH':
             return [], self._process_hatch(entity, transform)
 
@@ -223,6 +232,140 @@ class DXFParser:
 
         layer_name = getattr(entity.dxf, 'layer', None)
         return self._is_layer_renderable(layer_name)
+
+    def _should_collect_entity(self, entity: DXFEntity) -> bool:
+        """Return True when the entity should contribute to boundary parsing."""
+        return self._is_entity_renderable(entity) and not self._is_breakline_entity(entity)
+
+    def _is_breakline_entity(
+        self,
+        entity: DXFEntity,
+        transform: Optional[Matrix44] = None,
+    ) -> bool:
+        """
+        Exclude common breakline annotations before geometry extraction.
+
+        In practice these are usually placed on dedicated BREAK/BREAKLINE style
+        layers or inserted as named annotation blocks such as BREAKDATA.
+        """
+        layer_name = getattr(entity.dxf, 'layer', None)
+        if self._matches_breakline_name(layer_name):
+            return True
+
+        if entity.dxftype() == 'INSERT':
+            block_name = getattr(entity.dxf, 'name', None)
+            if self._matches_breakline_name(block_name):
+                return True
+
+        if self._matches_annotation_layer_name(layer_name) and self._looks_like_breakline_polyline(
+            entity,
+            transform=transform,
+        ):
+            return True
+
+        return False
+
+    def _matches_breakline_name(self, name: Optional[str]) -> bool:
+        """Match common breakline naming conventions using a loose substring check."""
+        if not name:
+            return False
+
+        normalized = str(name).strip().lower()
+        return any(keyword in normalized for keyword in self.BREAKLINE_NAME_KEYWORDS)
+
+    def _matches_annotation_layer_name(self, name: Optional[str]) -> bool:
+        """Match symbol/annotation layers where breaklines are often stored."""
+        if not name:
+            return False
+
+        normalized = str(name).strip().lower()
+        return any(keyword in normalized for keyword in self.ANNOTATION_LAYER_KEYWORDS)
+
+    def _looks_like_breakline_polyline(
+        self,
+        entity: DXFEntity,
+        transform: Optional[Matrix44] = None,
+    ) -> bool:
+        """
+        Detect open zig-zag breaklines placed on symbol/annotation layers.
+
+        Typical breaklines have long lead-in/out segments with a compact
+        saw-tooth center; this keeps the heuristic narrower than "any open
+        symbol polyline".
+        """
+        if entity.dxftype() not in {'LWPOLYLINE', 'POLYLINE'}:
+            return False
+
+        if self._polyline_is_closed(entity):
+            return False
+
+        points = self._get_polyline_points(entity, transform=transform)
+        if len(points) < 5:
+            return False
+
+        vectors: List[Tuple[float, float]] = []
+        lengths: List[float] = []
+        for start, end in zip(points, points[1:]):
+            dx = end.x - start.x
+            dy = end.y - start.y
+            length = math.hypot(dx, dy)
+            if length <= 1e-6:
+                continue
+            vectors.append((dx, dy))
+            lengths.append(length)
+
+        if len(lengths) < 4:
+            return False
+
+        chord = math.hypot(points[-1].x - points[0].x, points[-1].y - points[0].y)
+        if chord <= 1e-6:
+            return False
+
+        path_to_chord_ratio = sum(lengths) / chord
+        if path_to_chord_ratio < 1.08 or path_to_chord_ratio > 3.0:
+            return False
+
+        middle_lengths = sorted(lengths[1:-1])
+        if not middle_lengths:
+            return False
+
+        middle_median = middle_lengths[len(middle_lengths) // 2]
+        if lengths[0] < middle_median * 2.0 or lengths[-1] < middle_median * 2.0:
+            return False
+
+        sharp_turns = 0
+        for previous, current in zip(vectors, vectors[1:]):
+            previous_angle = math.degrees(math.atan2(previous[1], previous[0]))
+            current_angle = math.degrees(math.atan2(current[1], current[0]))
+            turn = abs((current_angle - previous_angle + 180.0) % 360.0 - 180.0)
+            if turn >= 45.0:
+                sharp_turns += 1
+
+        return sharp_turns >= 2
+
+    def _polyline_is_closed(self, entity: DXFEntity) -> bool:
+        """Handle closed-flag access across ezdxf polyline entity variants."""
+        if entity.dxftype() == 'LWPOLYLINE':
+            return bool(entity.closed)
+        if entity.dxftype() == 'POLYLINE':
+            return bool(entity.is_closed)
+        return False
+
+    def _get_polyline_points(
+        self,
+        entity: DXFEntity,
+        transform: Optional[Matrix44] = None,
+    ) -> List[Point]:
+        """Return transformed polyline vertices in normalized millimeter units."""
+        if entity.dxftype() == 'LWPOLYLINE':
+            raw_points = list(entity.vertices_in_wcs())
+        else:
+            raw_points = [
+                (vertex.dxf.location.x, vertex.dxf.location.y)
+                for vertex in entity.vertices
+            ]
+
+        return [self._apply_transform((point[0], point[1]), transform) for point in raw_points]
 
     def _is_layer_renderable(self, layer_name: Optional[str]) -> bool:
         """
@@ -539,12 +682,20 @@ class DXFParser:
 
         segments = []
         prev_point = None
+        transformed_center = self._apply_transform((arc.dxf.center.x, arc.dxf.center.y), transform)
+        arc_group_id = self._next_arc_group_id()
+        arc_start = None
+        arc_end = None
 
         for i in range(num_segments + 1):
             angle = start_angle + i * angle_step
             x = arc.dxf.center.x + arc.dxf.radius * math.cos(angle)
             y = arc.dxf.center.y + arc.dxf.radius * math.sin(angle)
             curr_point = self._apply_transform((x, y), transform)
+            if i == 0:
+                arc_start = curr_point
+            if i == num_segments:
+                arc_end = curr_point
 
             if prev_point is not None:
                 segments.append(Segment(
@@ -554,10 +705,15 @@ class DXFParser:
                         'type': 'arc_segment',
                         'layer': arc.dxf.layer,
                         'center': [
-                            arc.dxf.center.x * self.unit_scale_to_mm,
-                            arc.dxf.center.y * self.unit_scale_to_mm,
+                            transformed_center.x,
+                            transformed_center.y,
                         ],
                         'radius': arc.dxf.radius * self.unit_scale_to_mm,
+                        'sweep_angle_deg': math.degrees(total_angle),
+                        'arc_group_id': arc_group_id,
+                        'arc_start': [arc_start.x, arc_start.y] if arc_start else None,
+                        'arc_end': [curr_point.x, curr_point.y],
+                        'source_entity': 'ARC',
                     }
                 ))
 
@@ -693,6 +849,7 @@ class DXFParser:
         angle_step = (end_angle - start_angle) / num_segments
 
         segments = []
+        arc_group_id = self._next_arc_group_id()
         prev_point = start
 
         for i in range(1, num_segments + 1):
@@ -707,13 +864,22 @@ class DXFParser:
                 meta={
                     'type': 'arc_segment',
                     'center': (center.x, center.y),
-                    'radius': radius
+                    'radius': radius,
+                    'sweep_angle_deg': abs(math.degrees(end_angle - start_angle)),
+                    'arc_group_id': arc_group_id,
+                    'arc_start': [start.x, start.y],
+                    'arc_end': [end.x, end.y],
+                    'source_entity': 'LWPOLYLINE_BULGE',
                 }
             ))
 
             prev_point = curr_point
 
         return segments
+
+    def _next_arc_group_id(self) -> int:
+        self._arc_group_counter += 1
+        return self._arc_group_counter
 
     def _calculate_bbox(self, segments: List[Segment]) -> Dict[str, float]:
         """

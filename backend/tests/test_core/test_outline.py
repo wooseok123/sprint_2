@@ -172,3 +172,55 @@ def test_outline_v2_falls_back_to_parallel_pairs_without_connectors():
     assert polygon is not None
     assert polygon.area > 500000
     assert metadata["estimate_method"] in {"parallel_pairs", "bbox_fallback"}
+
+
+def test_outline_v2_opening_removes_small_protrusion():
+    polygon = Polygon([
+        (0, 0),
+        (1000, 0),
+        (1000, 250),
+        (1040, 250),
+        (1040, 310),
+        (1000, 310),
+        (1000, 600),
+        (0, 600),
+    ])
+
+    extractor = OutlineExtractorV2()
+    cleaned, metadata = extractor._apply_opening_with_guard(polygon, wall_thickness=80.0)
+
+    assert cleaned.bounds[2] == pytest.approx(1000.0, abs=1.0)
+    assert metadata["opening_applied"] is True
+    assert metadata["opening_rollback_reasons"] == []
+
+
+def test_outline_v2_opening_rolls_back_when_result_collapses():
+    polygon = Polygon([(0, 0), (100, 0), (100, 100), (0, 100)])
+
+    extractor = OutlineExtractorV2(opening_radius_ratio=2.0)
+    cleaned, metadata = extractor._apply_opening_with_guard(polygon, wall_thickness=120.0)
+
+    assert cleaned.equals(polygon)
+    assert metadata["opening_applied"] is False
+    assert "empty_result" in metadata["opening_rollback_reasons"]
+
+
+def test_outline_v2_closing_fills_small_inward_notch():
+    polygon = Polygon([
+        (0, 0),
+        (1000, 0),
+        (1000, 250),
+        (960, 250),
+        (960, 310),
+        (1000, 310),
+        (1000, 600),
+        (0, 600),
+    ])
+
+    extractor = OutlineExtractorV2()
+    cleaned, metadata = extractor._apply_closing_with_guard(polygon, wall_thickness=80.0)
+
+    assert cleaned.bounds[2] == pytest.approx(1000.0, abs=1.0)
+    assert cleaned.area > polygon.area
+    assert metadata["closing_applied"] is True
+    assert metadata["closing_rollback_reasons"] == []

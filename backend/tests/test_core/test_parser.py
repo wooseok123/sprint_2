@@ -127,6 +127,54 @@ class TestDXFParserInsertExpansion:
             "maxY": 0,
         }
 
+    def test_parse_skips_breakline_named_layers(self):
+        """Common BREAK/BREAKLINE layers should be ignored automatically."""
+        doc = self._new_doc()
+        doc.layers.add("A-WAL")
+        doc.layers.add("BREAKLINE")
+
+        msp = doc.modelspace()
+        msp.add_line((0, 0), (100, 0), dxfattribs={"layer": "A-WAL"})
+        msp.add_lwpolyline(
+            [(20, 20), (30, 30), (40, 10), (50, 30), (60, 20)],
+            dxfattribs={"layer": "BREAKLINE"},
+        )
+
+        parsed = self._parse_document(doc)
+
+        assert parsed.entity_count == 1
+        assert len(parsed.segments) == 1
+        assert parsed.bbox == {
+            "minX": 0.0,
+            "minY": 0.0,
+            "maxX": 100.0,
+            "maxY": 0.0,
+        }
+
+    def test_parse_skips_breakline_shaped_open_polylines_on_symbol_layers(self):
+        """Open zig-zag polylines on symbol layers should be treated as breaklines."""
+        doc = self._new_doc()
+        doc.layers.add("A-WAL")
+        doc.layers.add("A-SYM")
+
+        msp = doc.modelspace()
+        msp.add_line((0, 0), (100, 0), dxfattribs={"layer": "A-WAL"})
+        msp.add_lwpolyline(
+            [(0, 0), (80, 30), (92, 18), (100, 42), (112, 18), (190, 30)],
+            dxfattribs={"layer": "A-SYM"},
+        )
+
+        parsed = self._parse_document(doc)
+
+        assert parsed.entity_count == 1
+        assert len(parsed.segments) == 1
+        assert parsed.bbox == {
+            "minX": 0.0,
+            "minY": 0.0,
+            "maxX": 100.0,
+            "maxY": 0.0,
+        }
+
     def test_parse_skips_invisible_entities(self):
         """Entities with the DXF invisible flag should be ignored."""
         doc = self._new_doc()
@@ -143,6 +191,45 @@ class TestDXFParserInsertExpansion:
             "minY": 0,
             "maxX": 0,
             "maxY": 0,
+        }
+
+    def test_parse_preserves_symbol_like_linework_for_polygon_stage_cleanup(self):
+        """Parser should preserve symbol-like geometry for polygon-stage cleanup."""
+        doc = self._new_doc()
+        msp = doc.modelspace()
+
+        outer = [(0, 0), (400, 0), (400, 300), (0, 300)]
+        inner = [(40, 40), (360, 40), (360, 260), (40, 260)]
+
+        for points in (outer, inner):
+            for index, start in enumerate(points):
+                end = points[(index + 1) % len(points)]
+                msp.add_line(start, end)
+
+        for outer_point, inner_point in zip(outer, inner):
+            msp.add_line(outer_point, inner_point)
+
+        door_curve = [
+            (140, 60),
+            (157, 62),
+            (173, 67),
+            (188, 76),
+            (201, 87),
+            (212, 100),
+            (221, 115),
+            (226, 131),
+            (228, 148),
+        ]
+        msp.add_lwpolyline(door_curve, close=False)
+
+        parsed = self._parse_document(doc)
+
+        assert len(parsed.segments) == 20
+        assert parsed.bbox == {
+            "minX": 0.0,
+            "minY": 0.0,
+            "maxX": 400.0,
+            "maxY": 300.0,
         }
 
     def _parse_document(self, doc):

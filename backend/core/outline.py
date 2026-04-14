@@ -33,6 +33,13 @@ class OutlineExtractorV2:
         courtyard_hole_ratio: float = 0.08,
         max_courtyard_hole_ratio: float = 0.2,
         max_courtyard_holes: int = 2,
+        opening_radius_ratio: float = 0.75,
+        opening_min_area_ratio: float = 0.9,
+        opening_min_bbox_ratio: float = 0.94,
+        opening_max_hull_ratio_delta: float = 0.08,
+        closing_max_area_ratio: float = 1.08,
+        closing_max_bbox_ratio: float = 1.03,
+        closing_max_hull_ratio_delta: float = 0.08,
     ):
         self.min_wall_thickness = min_wall_thickness
         self.max_wall_thickness = max_wall_thickness
@@ -42,6 +49,13 @@ class OutlineExtractorV2:
         self.courtyard_hole_ratio = courtyard_hole_ratio
         self.max_courtyard_hole_ratio = max_courtyard_hole_ratio
         self.max_courtyard_holes = max_courtyard_holes
+        self.opening_radius_ratio = opening_radius_ratio
+        self.opening_min_area_ratio = opening_min_area_ratio
+        self.opening_min_bbox_ratio = opening_min_bbox_ratio
+        self.opening_max_hull_ratio_delta = opening_max_hull_ratio_delta
+        self.closing_max_area_ratio = closing_max_area_ratio
+        self.closing_max_bbox_ratio = closing_max_bbox_ratio
+        self.closing_max_hull_ratio_delta = closing_max_hull_ratio_delta
 
     def extract_boundary(self, segments: List[Segment]) -> Tuple[Optional[Polygon], Dict]:
         """
@@ -96,6 +110,16 @@ class OutlineExtractorV2:
                 eroded_polygon = refined
                 concave_used = True
 
+        opened_polygon, opening_metadata = self._apply_opening_with_guard(
+            eroded_polygon,
+            wall_thickness=radius * 2.0,
+        )
+        closed_polygon, closing_metadata = self._apply_closing_with_guard(
+            opened_polygon,
+            wall_thickness=radius * 2.0,
+        )
+        eroded_polygon = closed_polygon
+
         metadata = {
             "method": "outline_v2",
             "buffer_radius": radius,
@@ -108,6 +132,8 @@ class OutlineExtractorV2:
         }
         metadata.update(erosion_metadata)
         metadata.update(footprint_metadata)
+        metadata.update(opening_metadata)
+        metadata.update(closing_metadata)
         return eroded_polygon, metadata
 
     def _segments_to_linestrings(self, segments: List[Segment]) -> List[LineString]:
@@ -278,6 +304,178 @@ class OutlineExtractorV2:
 
         logger.info("Applied concave_hull fallback with ratio %.2f", self.concave_hull_ratio)
         return refined_polygon
+
+    def _apply_opening_with_guard(
+        self,
+        polygon: Polygon,
+        wall_thickness: float,
+    ) -> Tuple[Polygon, Dict]:
+        metadata = {
+            "opening_attempted": False,
+            "opening_applied": False,
+            "opening_radius": 0.0,
+            "opening_area_ratio": 1.0,
+            "opening_bbox_ratio": 1.0,
+            "opening_hole_delta": 0,
+            "opening_hull_ratio_delta": 0.0,
+            "opening_rollback_reasons": [],
+        }
+
+        if polygon is None or polygon.is_empty or wall_thickness <= 0:
+            metadata["opening_rollback_reasons"] = ["invalid_input"]
+            return polygon, metadata
+
+        radius = min(
+            wall_thickness * self.opening_radius_ratio * 0.5,
+            self.max_wall_thickness * 0.5,
+        )
+        if radius <= 0:
+            metadata["opening_rollback_reasons"] = ["non_positive_radius"]
+            return polygon, metadata
+
+        metadata["opening_attempted"] = True
+        metadata["opening_radius"] = radius
+
+        opened = polygon.buffer(-radius, join_style="mitre").buffer(radius, join_style="mitre")
+        opened_polygon = self._select_polygon(opened)
+        if opened_polygon is None or opened_polygon.is_empty:
+            metadata["opening_rollback_reasons"] = ["empty_result"]
+            logger.info("Opening rollback: empty result for radius %.2f", radius)
+            return polygon, metadata
+
+        area_ratio = opened_polygon.area / polygon.area if polygon.area > 0 else 1.0
+        bbox_ratio = self._bbox_area_ratio(opened_polygon, polygon)
+        hole_delta = len(opened_polygon.interiors) - len(polygon.interiors)
+        hull_ratio_delta = abs(
+            self._convex_hull_ratio(opened_polygon) - self._convex_hull_ratio(polygon)
+        )
+
+        metadata["opening_area_ratio"] = area_ratio
+        metadata["opening_bbox_ratio"] = bbox_ratio
+        metadata["opening_hole_delta"] = hole_delta
+        metadata["opening_hull_ratio_delta"] = hull_ratio_delta
+
+        rollback_reasons: List[str] = []
+        if area_ratio < self.opening_min_area_ratio:
+            rollback_reasons.append("area_drop_exceeded")
+        if bbox_ratio < self.opening_min_bbox_ratio:
+            rollback_reasons.append("bbox_drop_exceeded")
+        if hole_delta != 0:
+            rollback_reasons.append("hole_count_changed")
+        if hull_ratio_delta > self.opening_max_hull_ratio_delta:
+            rollback_reasons.append("hull_ratio_delta_exceeded")
+
+        if rollback_reasons:
+            metadata["opening_rollback_reasons"] = rollback_reasons
+            logger.info(
+                "Opening rollback: reasons=%s radius=%.2f area_ratio=%.3f bbox_ratio=%.3f "
+                "hole_delta=%d hull_delta=%.3f",
+                ",".join(rollback_reasons),
+                radius,
+                area_ratio,
+                bbox_ratio,
+                hole_delta,
+                hull_ratio_delta,
+            )
+            return polygon, metadata
+
+        metadata["opening_applied"] = True
+        logger.info(
+            "Applied guarded opening: radius=%.2f area_ratio=%.3f bbox_ratio=%.3f "
+            "hole_delta=%d hull_delta=%.3f",
+            radius,
+            area_ratio,
+            bbox_ratio,
+            hole_delta,
+            hull_ratio_delta,
+        )
+        return opened_polygon, metadata
+
+    def _apply_closing_with_guard(
+        self,
+        polygon: Polygon,
+        wall_thickness: float,
+    ) -> Tuple[Polygon, Dict]:
+        metadata = {
+            "closing_attempted": False,
+            "closing_applied": False,
+            "closing_radius": 0.0,
+            "closing_area_ratio": 1.0,
+            "closing_bbox_ratio": 1.0,
+            "closing_hole_delta": 0,
+            "closing_hull_ratio_delta": 0.0,
+            "closing_rollback_reasons": [],
+        }
+
+        if polygon is None or polygon.is_empty or wall_thickness <= 0:
+            metadata["closing_rollback_reasons"] = ["invalid_input"]
+            return polygon, metadata
+
+        radius = min(
+            wall_thickness * self.opening_radius_ratio * 0.5,
+            self.max_wall_thickness * 0.5,
+        )
+        if radius <= 0:
+            metadata["closing_rollback_reasons"] = ["non_positive_radius"]
+            return polygon, metadata
+
+        metadata["closing_attempted"] = True
+        metadata["closing_radius"] = radius
+
+        closed = polygon.buffer(radius, join_style="mitre").buffer(-radius, join_style="mitre")
+        closed_polygon = self._select_polygon(closed)
+        if closed_polygon is None or closed_polygon.is_empty:
+            metadata["closing_rollback_reasons"] = ["empty_result"]
+            logger.info("Closing rollback: empty result for radius %.2f", radius)
+            return polygon, metadata
+
+        area_ratio = closed_polygon.area / polygon.area if polygon.area > 0 else 1.0
+        bbox_ratio = self._bbox_area_ratio(closed_polygon, polygon)
+        hole_delta = len(closed_polygon.interiors) - len(polygon.interiors)
+        hull_ratio_delta = abs(
+            self._convex_hull_ratio(closed_polygon) - self._convex_hull_ratio(polygon)
+        )
+
+        metadata["closing_area_ratio"] = area_ratio
+        metadata["closing_bbox_ratio"] = bbox_ratio
+        metadata["closing_hole_delta"] = hole_delta
+        metadata["closing_hull_ratio_delta"] = hull_ratio_delta
+
+        rollback_reasons: List[str] = []
+        if area_ratio > self.closing_max_area_ratio:
+            rollback_reasons.append("area_growth_exceeded")
+        if bbox_ratio > self.closing_max_bbox_ratio:
+            rollback_reasons.append("bbox_growth_exceeded")
+        if hole_delta != 0:
+            rollback_reasons.append("hole_count_changed")
+        if hull_ratio_delta > self.closing_max_hull_ratio_delta:
+            rollback_reasons.append("hull_ratio_delta_exceeded")
+
+        if rollback_reasons:
+            metadata["closing_rollback_reasons"] = rollback_reasons
+            logger.info(
+                "Closing rollback: reasons=%s radius=%.2f area_ratio=%.3f bbox_ratio=%.3f "
+                "hole_delta=%d hull_delta=%.3f",
+                ",".join(rollback_reasons),
+                radius,
+                area_ratio,
+                bbox_ratio,
+                hole_delta,
+                hull_ratio_delta,
+            )
+            return polygon, metadata
+
+        metadata["closing_applied"] = True
+        logger.info(
+            "Applied guarded closing: radius=%.2f area_ratio=%.3f bbox_ratio=%.3f "
+            "hole_delta=%d hull_delta=%.3f",
+            radius,
+            area_ratio,
+            bbox_ratio,
+            hole_delta,
+            hull_ratio_delta,
+        )
+        return closed_polygon, metadata
 
     def _looks_over_smoothed(self, polygon: Polygon, merged_polygon: Polygon) -> bool:
         if polygon is None or merged_polygon is None:
@@ -471,3 +669,13 @@ class OutlineExtractorV2:
         if hull.is_empty or hull.area == 0:
             return 1.0
         return polygon.area / hull.area
+
+    def _bbox_area_ratio(self, polygon: Polygon, baseline: Polygon) -> float:
+        baseline_bbox_area = self._polygon_bbox_area(baseline)
+        if baseline_bbox_area == 0:
+            return 1.0
+        return self._polygon_bbox_area(polygon) / baseline_bbox_area
+
+    def _polygon_bbox_area(self, polygon: Polygon) -> float:
+        min_x, min_y, max_x, max_y = polygon.bounds
+        return max(0.0, max_x - min_x) * max(0.0, max_y - min_y)
