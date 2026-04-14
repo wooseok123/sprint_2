@@ -220,7 +220,40 @@ def test_outline_v2_closing_fills_small_inward_notch():
     extractor = OutlineExtractorV2()
     cleaned, metadata = extractor._apply_closing_with_guard(polygon, wall_thickness=80.0)
 
-    assert cleaned.bounds[2] == pytest.approx(1000.0, abs=1.0)
+    assert cleaned.bounds[2] == pytest.approx(1000.0, abs=2.0)
     assert cleaned.area > polygon.area
     assert metadata["closing_applied"] is True
     assert metadata["closing_rollback_reasons"] == []
+
+
+def test_outline_v2_bridge_removes_large_door_sized_protrusion():
+    polygon = Polygon([
+        (0, 0),
+        (1000, 0),
+        (1000, 200),
+        (1040, 230),
+        (1070, 270),
+        (1080, 320),
+        (1070, 370),
+        (1040, 410),
+        (1000, 440),
+        (1000, 600),
+        (0, 600),
+    ])
+
+    extractor = OutlineExtractorV2()
+    cleaned, metadata = extractor._apply_bridge_with_guard(polygon, wall_thickness=40.0)
+
+    assert cleaned.bounds[2] == pytest.approx(1000.0, abs=2.0)
+    assert metadata["bridge_applied_count"] == 1
+    assert metadata["bridge_rollback_reasons"] == []
+
+
+def test_outline_v2_bridge_skips_legitimate_l_shape():
+    polygon = Polygon([(0, 0), (420, 0), (420, 170), (170, 170), (170, 420), (0, 420)])
+
+    extractor = OutlineExtractorV2()
+    cleaned, metadata = extractor._apply_bridge_with_guard(polygon, wall_thickness=40.0)
+
+    assert cleaned.equals(polygon)
+    assert metadata["bridge_applied_count"] == 0

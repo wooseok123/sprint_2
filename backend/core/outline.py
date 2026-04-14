@@ -40,6 +40,21 @@ class OutlineExtractorV2:
         closing_max_area_ratio: float = 1.08,
         closing_max_bbox_ratio: float = 1.03,
         closing_max_hull_ratio_delta: float = 0.08,
+        bridge_min_span_ratio: float = 4.0,
+        bridge_max_span_ratio: float = 60.0,
+        bridge_min_deviation_ratio: float = 0.5,
+        bridge_max_deviation_ratio: float = 8.0,
+        bridge_min_area_ratio: float = 5.0,
+        bridge_max_area_ratio: float = 180.0,
+        bridge_boxy_area_ratio: float = 4.0,
+        bridge_arc_path_ratio: float = 1.3,
+        bridge_bbox_min_ratio: float = 0.9,
+        bridge_bbox_max_ratio: float = 1.03,
+        bridge_max_hull_ratio_delta: float = 0.08,
+        curved_bridge_min_vertices: int = 5,
+        curved_bridge_min_turn_deg: float = 55.0,
+        curved_bridge_max_turn_deg: float = 125.0,
+        curved_bridge_max_step_turn_deg: float = 45.0,
     ):
         self.min_wall_thickness = min_wall_thickness
         self.max_wall_thickness = max_wall_thickness
@@ -56,6 +71,21 @@ class OutlineExtractorV2:
         self.closing_max_area_ratio = closing_max_area_ratio
         self.closing_max_bbox_ratio = closing_max_bbox_ratio
         self.closing_max_hull_ratio_delta = closing_max_hull_ratio_delta
+        self.bridge_min_span_ratio = bridge_min_span_ratio
+        self.bridge_max_span_ratio = bridge_max_span_ratio
+        self.bridge_min_deviation_ratio = bridge_min_deviation_ratio
+        self.bridge_max_deviation_ratio = bridge_max_deviation_ratio
+        self.bridge_min_area_ratio = bridge_min_area_ratio
+        self.bridge_max_area_ratio = bridge_max_area_ratio
+        self.bridge_boxy_area_ratio = bridge_boxy_area_ratio
+        self.bridge_arc_path_ratio = bridge_arc_path_ratio
+        self.bridge_bbox_min_ratio = bridge_bbox_min_ratio
+        self.bridge_bbox_max_ratio = bridge_bbox_max_ratio
+        self.bridge_max_hull_ratio_delta = bridge_max_hull_ratio_delta
+        self.curved_bridge_min_vertices = curved_bridge_min_vertices
+        self.curved_bridge_min_turn_deg = curved_bridge_min_turn_deg
+        self.curved_bridge_max_turn_deg = curved_bridge_max_turn_deg
+        self.curved_bridge_max_step_turn_deg = curved_bridge_max_step_turn_deg
 
     def extract_boundary(self, segments: List[Segment]) -> Tuple[Optional[Polygon], Dict]:
         """
@@ -118,7 +148,11 @@ class OutlineExtractorV2:
             opened_polygon,
             wall_thickness=radius * 2.0,
         )
-        eroded_polygon = closed_polygon
+        bridged_polygon, bridge_metadata = self._apply_bridge_with_guard(
+            closed_polygon,
+            wall_thickness=radius * 2.0,
+        )
+        eroded_polygon = bridged_polygon
 
         metadata = {
             "method": "outline_v2",
@@ -134,6 +168,7 @@ class OutlineExtractorV2:
         metadata.update(footprint_metadata)
         metadata.update(opening_metadata)
         metadata.update(closing_metadata)
+        metadata.update(bridge_metadata)
         return eroded_polygon, metadata
 
     def _segments_to_linestrings(self, segments: List[Segment]) -> List[LineString]:
@@ -477,6 +512,293 @@ class OutlineExtractorV2:
         )
         return closed_polygon, metadata
 
+    def _apply_bridge_with_guard(
+        self,
+        polygon: Polygon,
+        wall_thickness: float,
+    ) -> Tuple[Polygon, Dict]:
+        metadata = {
+            "bridge_attempted": False,
+            "bridge_candidates": 0,
+            "bridge_applied_count": 0,
+            "bridge_rollback_reasons": [],
+            "bridge_logs": [],
+        }
+
+        if polygon is None or polygon.is_empty or wall_thickness <= 0:
+            metadata["bridge_rollback_reasons"] = ["invalid_input"]
+            return polygon, metadata
+
+        current = polygon
+        applied = 0
+        rollback_reasons: List[str] = []
+        bridge_logs: List[str] = []
+
+        for _ in range(8):
+            candidate = self._find_bridge_candidate(current, wall_thickness)
+            if candidate is None:
+                break
+
+            metadata["bridge_attempted"] = True
+            metadata["bridge_candidates"] += 1
+            candidate_log = (
+                f"source={candidate.get('source', 'unknown')} "
+                f"start={candidate['start']} end={candidate['end']} "
+                f"span={candidate['span_ratio']:.2f}t dev={candidate['deviation_ratio']:.2f}t "
+                f"area={candidate['area_ratio']:.2f}t2 path={candidate['path_ratio']:.2f}"
+            )
+
+            bridged = self._bridge_candidate(current, candidate["start"], candidate["end"])
+            if bridged is None:
+                rollback_reasons.append("invalid_bridge_geometry")
+                bridge_logs.append(f"rollback:{candidate_log}:invalid")
+                break
+
+            bbox_ratio = self._bbox_area_ratio(bridged, current)
+            hull_ratio_delta = abs(
+                self._convex_hull_ratio(bridged) - self._convex_hull_ratio(current)
+            )
+            hole_delta = len(bridged.interiors) - len(current.interiors)
+
+            if bbox_ratio < self.bridge_bbox_min_ratio:
+                rollback_reasons.append("bbox_drop_exceeded")
+                bridge_logs.append(f"rollback:{candidate_log}:bbox_drop={bbox_ratio:.3f}")
+                break
+            if bbox_ratio > self.bridge_bbox_max_ratio:
+                rollback_reasons.append("bbox_growth_exceeded")
+                bridge_logs.append(f"rollback:{candidate_log}:bbox_growth={bbox_ratio:.3f}")
+                break
+            if hole_delta != 0:
+                rollback_reasons.append("hole_count_changed")
+                bridge_logs.append(f"rollback:{candidate_log}:hole_delta={hole_delta}")
+                break
+            if hull_ratio_delta > self.bridge_max_hull_ratio_delta:
+                rollback_reasons.append("hull_ratio_delta_exceeded")
+                bridge_logs.append(f"rollback:{candidate_log}:hull_delta={hull_ratio_delta:.3f}")
+                break
+
+            bridge_logs.append(f"applied:{candidate_log}")
+            current = bridged
+            applied += 1
+
+        metadata["bridge_applied_count"] = applied
+        metadata["bridge_rollback_reasons"] = rollback_reasons
+        metadata["bridge_logs"] = bridge_logs
+        if applied:
+            logger.info("Applied %d polygon bridges: %s", applied, "; ".join(bridge_logs[:5]))
+        elif rollback_reasons:
+            logger.info("Bridge rollback: %s", "; ".join(bridge_logs[:5]))
+        return current, metadata
+
+    def _find_bridge_candidate(
+        self,
+        polygon: Polygon,
+        wall_thickness: float,
+    ) -> Optional[Dict]:
+        candidate = self._find_reflex_bridge_candidate(polygon, wall_thickness)
+        if candidate is not None:
+            candidate["source"] = "reflex"
+            return candidate
+
+        candidate = self._find_curved_bridge_candidate(polygon, wall_thickness)
+        if candidate is not None:
+            candidate["source"] = "curved"
+        return candidate
+
+    def _find_reflex_bridge_candidate(
+        self,
+        polygon: Polygon,
+        wall_thickness: float,
+    ) -> Optional[Dict]:
+        coords = list(polygon.exterior.coords[:-1])
+        if len(coords) < 6:
+            return None
+
+        reflex_indices = self._find_reflex_vertices(coords)
+        if len(reflex_indices) < 2:
+            return None
+
+        best_candidate = None
+        for offset, start in enumerate(reflex_indices):
+            end = reflex_indices[(offset + 1) % len(reflex_indices)]
+            chain = self._slice_ring(coords, start, end)
+            if len(chain) < 3 or len(chain) > 16:
+                continue
+
+            chord = self._distance(chain[0], chain[-1])
+            if chord <= 0:
+                continue
+
+            span_ratio = chord / wall_thickness
+            if not (self.bridge_min_span_ratio <= span_ratio <= self.bridge_max_span_ratio):
+                continue
+
+            path_length = self._path_length(chain)
+            path_ratio = path_length / chord if chord > 0 else float("inf")
+            deviation = max(self._point_line_distance(point, chain[0], chain[-1]) for point in chain[1:-1]) if len(chain) > 2 else 0.0
+            deviation_ratio = deviation / wall_thickness
+            if not (self.bridge_min_deviation_ratio <= deviation_ratio <= self.bridge_max_deviation_ratio):
+                continue
+
+            feature_area = abs(Polygon(chain).area)
+            area_ratio = feature_area / (wall_thickness * wall_thickness)
+            if not (self.bridge_min_area_ratio <= area_ratio <= self.bridge_max_area_ratio):
+                continue
+
+            if path_ratio > self.bridge_arc_path_ratio and area_ratio > self.bridge_boxy_area_ratio:
+                continue
+
+            candidate = {
+                "start": start,
+                "end": end,
+                "span_ratio": span_ratio,
+                "path_ratio": path_ratio,
+                "deviation_ratio": deviation_ratio,
+                "area_ratio": area_ratio,
+            }
+            if best_candidate is None or candidate["area_ratio"] < best_candidate["area_ratio"]:
+                best_candidate = candidate
+
+        return best_candidate
+
+    def _find_curved_bridge_candidate(
+        self,
+        polygon: Polygon,
+        wall_thickness: float,
+    ) -> Optional[Dict]:
+        coords = list(polygon.exterior.coords[:-1])
+        if len(coords) < self.curved_bridge_min_vertices:
+            return None
+
+        best_candidate = None
+        ring_length = len(coords)
+        max_span = min(ring_length - 1, 18)
+
+        for start in range(ring_length):
+            cumulative_turn = 0.0
+            turn_sign = 0
+            step_turns: List[float] = []
+            turn_count = 0
+
+            for step in range(2, max_span + 1):
+                end = (start + step) % ring_length
+                turn = self._signed_turn(coords[(start + step - 2) % ring_length], coords[(start + step - 1) % ring_length], coords[end])
+                turn_deg = abs(math.degrees(turn))
+                if turn_deg < 2.0:
+                    continue
+
+                current_sign = 1 if turn > 0 else -1
+                if turn_sign == 0:
+                    turn_sign = current_sign
+                elif current_sign != turn_sign:
+                    break
+
+                cumulative_turn += turn_deg
+                step_turns.append(turn_deg)
+                turn_count += 1
+
+                chain = self._slice_ring(coords, start, end)
+                if len(chain) < self.curved_bridge_min_vertices:
+                    continue
+                if turn_count < 2:
+                    continue
+                if not (self.curved_bridge_min_turn_deg <= cumulative_turn <= self.curved_bridge_max_turn_deg):
+                    continue
+                smoothed_turns = step_turns[1:-1] if len(step_turns) > 2 else step_turns[:-1]
+                max_smoothed_turn = max(smoothed_turns) if smoothed_turns else 0.0
+                if max_smoothed_turn > self.curved_bridge_max_step_turn_deg:
+                    continue
+
+                chord = self._distance(chain[0], chain[-1])
+                if chord <= 0:
+                    continue
+                span_ratio = chord / wall_thickness
+                if not (self.bridge_min_span_ratio <= span_ratio <= self.bridge_max_span_ratio):
+                    continue
+
+                path_length = self._path_length(chain)
+                path_ratio = path_length / chord
+                deviation = max(
+                    self._point_line_distance(point, chain[0], chain[-1])
+                    for point in chain[1:-1]
+                )
+                deviation_ratio = deviation / wall_thickness
+                if not (self.bridge_min_deviation_ratio <= deviation_ratio <= self.bridge_max_deviation_ratio):
+                    continue
+
+                feature_area = abs(Polygon(chain).area)
+                area_ratio = feature_area / (wall_thickness * wall_thickness)
+                if not (self.bridge_min_area_ratio <= area_ratio <= self.bridge_max_area_ratio):
+                    continue
+
+                score = (
+                    abs(cumulative_turn - 90.0)
+                    + abs(path_ratio - 1.12) * 40.0
+                    + abs(span_ratio - 28.0) * 0.25
+                    - min(turn_count, 8) * 2.0
+                )
+                candidate = {
+                    "start": start,
+                    "end": end,
+                    "span_ratio": span_ratio,
+                    "path_ratio": path_ratio,
+                    "deviation_ratio": deviation_ratio,
+                    "area_ratio": area_ratio,
+                    "turn_deg": cumulative_turn,
+                    "turn_count": turn_count,
+                    "max_smoothed_turn_deg": max_smoothed_turn,
+                    "score": score,
+                }
+                if best_candidate is None or candidate["score"] < best_candidate["score"]:
+                    best_candidate = candidate
+
+        return best_candidate
+
+    def _bridge_candidate(
+        self,
+        polygon: Polygon,
+        start: int,
+        end: int,
+    ) -> Optional[Polygon]:
+        coords = list(polygon.exterior.coords[:-1])
+        if len(coords) < 4:
+            return None
+
+        rotated = coords[start:] + coords[:start]
+        rotated_end = (end - start) % len(coords)
+        if rotated_end <= 0 or rotated_end >= len(rotated):
+            return None
+
+        new_exterior = rotated[:1] + rotated[rotated_end:]
+        if len(new_exterior) < 3:
+            return None
+
+        bridged = Polygon(new_exterior, [list(interior.coords) for interior in polygon.interiors])
+        if not bridged.is_valid:
+            bridged = bridged.buffer(0)
+            bridged = self._select_polygon(bridged)
+
+        if bridged is None or bridged.is_empty:
+            return None
+        return bridged
+
+    def _find_reflex_vertices(self, coords: List[Tuple[float, float]]) -> List[int]:
+        orientation = self._ring_orientation(coords)
+        if orientation == 0:
+            return []
+
+        reflex: List[int] = []
+        epsilon = 1e-6
+        count = len(coords)
+        for index in range(count):
+            prev_point = coords[index - 1]
+            curr_point = coords[index]
+            next_point = coords[(index + 1) % count]
+            turn = self._cross(prev_point, curr_point, next_point) * orientation
+            if turn < -epsilon:
+                reflex.append(index)
+        return reflex
+
     def _looks_over_smoothed(self, polygon: Polygon, merged_polygon: Polygon) -> bool:
         if polygon is None or merged_polygon is None:
             return False
@@ -679,3 +1001,78 @@ class OutlineExtractorV2:
     def _polygon_bbox_area(self, polygon: Polygon) -> float:
         min_x, min_y, max_x, max_y = polygon.bounds
         return max(0.0, max_x - min_x) * max(0.0, max_y - min_y)
+
+    def _ring_orientation(self, coords: List[Tuple[float, float]]) -> int:
+        signed_area = 0.0
+        for index, point in enumerate(coords):
+            next_point = coords[(index + 1) % len(coords)]
+            signed_area += point[0] * next_point[1] - next_point[0] * point[1]
+        if signed_area > 0:
+            return 1
+        if signed_area < 0:
+            return -1
+        return 0
+
+    def _slice_ring(
+        self,
+        coords: List[Tuple[float, float]],
+        start: int,
+        end: int,
+    ) -> List[Tuple[float, float]]:
+        if start <= end:
+            return coords[start:end + 1]
+        return coords[start:] + coords[:end + 1]
+
+    def _path_length(self, coords: List[Tuple[float, float]]) -> float:
+        return sum(
+            self._distance(coords[index], coords[index + 1])
+            for index in range(len(coords) - 1)
+        )
+
+    def _distance(self, left: Tuple[float, float], right: Tuple[float, float]) -> float:
+        return math.hypot(right[0] - left[0], right[1] - left[1])
+
+    def _point_line_distance(
+        self,
+        point: Tuple[float, float],
+        line_start: Tuple[float, float],
+        line_end: Tuple[float, float],
+    ) -> float:
+        dx = line_end[0] - line_start[0]
+        dy = line_end[1] - line_start[1]
+        length = math.hypot(dx, dy)
+        if length == 0:
+            return self._distance(point, line_start)
+        return abs(
+            (point[0] - line_start[0]) * dy
+            - (point[1] - line_start[1]) * dx
+        ) / length
+
+    def _cross(
+        self,
+        prev_point: Tuple[float, float],
+        curr_point: Tuple[float, float],
+        next_point: Tuple[float, float],
+    ) -> float:
+        return (
+            (curr_point[0] - prev_point[0]) * (next_point[1] - curr_point[1])
+            - (curr_point[1] - prev_point[1]) * (next_point[0] - curr_point[0])
+        )
+
+    def _signed_turn(
+        self,
+        prev_point: Tuple[float, float],
+        curr_point: Tuple[float, float],
+        next_point: Tuple[float, float],
+    ) -> float:
+        inbound = (
+            curr_point[0] - prev_point[0],
+            curr_point[1] - prev_point[1],
+        )
+        outbound = (
+            next_point[0] - curr_point[0],
+            next_point[1] - curr_point[1],
+        )
+        angle_in = math.atan2(inbound[1], inbound[0])
+        angle_out = math.atan2(outbound[1], outbound[0])
+        return (angle_out - angle_in + math.pi) % (2 * math.pi) - math.pi
