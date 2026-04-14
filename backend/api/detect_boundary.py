@@ -156,7 +156,7 @@ async def detect_boundary(file: UploadFile = File(...)):
                 # TODO: AI judgment integration (requires Gemini API key)
                 # For now, proceed with caution
 
-            use_v2 = os.getenv("BOUNDARY_EXTRACTOR_V2", "false").lower() == "true"
+            use_v2 = "true"
             cycles = []
 
             if use_v2:
