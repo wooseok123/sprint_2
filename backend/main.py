@@ -6,11 +6,11 @@ import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
 import logging
+from env_utils import load_backend_env
 
 # Load environment variables
-load_dotenv()
+load_backend_env()
 
 # Configure logging
 logging.basicConfig(

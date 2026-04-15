@@ -2,37 +2,24 @@
 Experimental Gemini-assisted cleanup for suspicious boundary protrusions.
 
 This module keeps the final geometry edit in local vector space. Gemini is used
-only to judge whether a highlighted ROI looks like a removable artifact such as
-door swings, triangular door leaves, or thin whisker-like spikes.
+only on structured text features derived from the extracted outline and its
+local candidate geometry.
 """
 from __future__ import annotations
 
-import base64
 from dataclasses import dataclass
 import json
 import logging
 import math
 import os
+from statistics import median
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
-import numpy as np
-from shapely.geometry import GeometryCollection, LineString, MultiPolygon, Polygon, box
+from shapely.geometry import GeometryCollection, MultiPolygon, Polygon, box
 
-from core.outline_cv_fallback import (
-    _collect_roi_segments,
-    _expand_bounds,
-    _select_polygon,
-    _world_to_pixel,
-    collect_cv_candidate_bounds,
-)
 from core.parser import Segment
-
-try:  # pragma: no cover - optional runtime dependency
-    import cv2
-except ImportError:  # pragma: no cover - handled at runtime
-    cv2 = None
 
 
 logger = logging.getLogger(__name__)
@@ -47,10 +34,14 @@ class VisionCleanupCandidate:
     bounds: Bounds
     mask_polygon: Optional[Polygon] = None
     score_hint: float = 0.0
+    span_start_idx: Optional[int] = None
+    span_end_idx: Optional[int] = None
+    span_reason: str = ""
+    span_confidence: float = 0.0
 
 
 class GeminiVisionJudge:
-    """Minimal REST client for Gemini multimodal judgments."""
+    """Minimal REST client for Gemini structured-feature judgments."""
 
     def __init__(
         self,
@@ -66,22 +57,15 @@ class GeminiVisionJudge:
     def judge_candidate(
         self,
         *,
-        image_bytes: bytes,
         candidate: VisionCleanupCandidate,
-        metrics: Dict[str, Any],
+        feature_payload: Dict[str, Any],
     ) -> Dict[str, Any]:
-        prompt = self._build_prompt(candidate=candidate, metrics=metrics)
+        prompt = self._build_prompt(candidate=candidate, feature_payload=feature_payload)
         payload = {
             "contents": [
                 {
                     "parts": [
                         {"text": prompt},
-                        {
-                            "inline_data": {
-                                "mime_type": "image/png",
-                                "data": base64.b64encode(image_bytes).decode("ascii"),
-                            }
-                        },
                     ]
                 }
             ],
@@ -89,6 +73,8 @@ class GeminiVisionJudge:
                 "temperature": 0.1,
                 "topP": 0.95,
                 "maxOutputTokens": 256,
+                "responseMimeType": "application/json",
+                "thinkingConfig": {"thinkingBudget": 0},
             },
         }
         response_payload = self._post_generate_content(payload)
@@ -98,6 +84,38 @@ class GeminiVisionJudge:
         verdict = self._parse_verdict_json(text)
         verdict["raw_text"] = text
         return verdict
+
+    def propose_suspicious_spans(
+        self,
+        *,
+        outline_payload: Dict[str, Any],
+        max_spans: int,
+    ) -> List[Dict[str, Any]]:
+        prompt = self._build_global_scan_prompt(outline_payload=outline_payload, max_spans=max_spans)
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": prompt},
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.1,
+                "topP": 0.95,
+                "maxOutputTokens": 512,
+                "responseMimeType": "application/json",
+                "thinkingConfig": {"thinkingBudget": 0},
+            },
+        }
+        response_payload = self._post_generate_content(payload)
+        text = self._extract_text(response_payload)
+        if not text:
+            raise ValueError("Gemini response did not contain any text parts")
+        spans = self._parse_suspicious_spans_json(text)
+        for span in spans:
+            span["raw_text"] = text
+        return spans
 
     def _post_generate_content(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         url = (
@@ -136,7 +154,7 @@ class GeminiVisionJudge:
 
         payload = json.loads(text[start:end + 1])
         decision = str(payload.get("decision", "")).strip().lower()
-        if decision not in {"keep", "remove"}:
+        if decision not in {"keep", "remove", "uncertain"}:
             raise ValueError(f"Unexpected Gemini decision: {decision!r}")
 
         confidence_raw = payload.get("confidence", 0.0)
@@ -156,31 +174,96 @@ class GeminiVisionJudge:
         self,
         *,
         candidate: VisionCleanupCandidate,
-        metrics: Dict[str, Any],
+        feature_payload: Dict[str, Any],
     ) -> str:
-        return (
-            "You are reviewing a CAD floor-plan boundary overlay.\n"
-            "Image legend:\n"
-            "- light gray lines: preprocessed DXF linework\n"
-            "- red line: current detected exterior boundary\n"
-            "- cyan highlight: suspicious outward feature under review\n"
-            "- blue box: ROI around the suspicious feature\n\n"
-            "Decide whether the cyan-highlighted feature should be REMOVED from the red boundary.\n"
-            "Remove only when it is clearly a boundary artifact such as:\n"
-            "- a door swing or door leaf shown as a semicircle, triangle, or diagonal flap\n"
-            "- a thin whisker/spike caused by leftover linework\n"
-            "- a tiny outward bump unsupported by surrounding wall geometry\n\n"
-            "Keep when it looks like a legitimate footprint step, balcony, annex, or wall mass.\n"
-            "If uncertain, prefer keep.\n\n"
-            f"Candidate kind: {candidate.kind}\n"
-            f"Candidate source: {candidate.source}\n"
-            f"Candidate width_mm: {metrics['width_mm']:.2f}\n"
-            f"Candidate height_mm: {metrics['height_mm']:.2f}\n"
-            f"Candidate area_mm2: {metrics['area_mm2']:.2f}\n"
-            f"Candidate aspect_ratio: {metrics['aspect_ratio']:.2f}\n\n"
-            "Respond with JSON only using this schema:\n"
-            '{"decision":"keep|remove","confidence":0.0,"feature_type":"door_arc|door_leaf|thin_spike|legit_mass|unclear","reason":"short explanation"}'
+        system_prompt = (
+            "You are a conservative CAD exterior-boundary cleanup judge.\n"
+            "You receive only structured geometric features for one suspicious outward boundary candidate.\n"
+            "Decide whether the candidate should be removed from the exterior boundary.\n"
+            "Remove only when the feature is clearly an artifact such as:\n"
+            "- a thin spike or whisker\n"
+            "- a door swing, door leaf, or triangular flap\n"
+            "- a tiny outward detour unsupported by surrounding wall mass\n"
+            "Keep when the feature could plausibly be a legitimate footprint step, balcony, annex, or wall offset.\n"
+            "If the evidence is mixed or insufficient, return uncertain.\n"
+            "Never infer visual cues that are not present in the feature JSON.\n"
+            "Prefer conservative decisions.\n"
         )
+        user_payload = {
+            "candidate_kind": candidate.kind,
+            "candidate_source": candidate.source,
+            "feature_summary": feature_payload,
+        }
+        return (
+            f"{system_prompt}\n"
+            "Candidate feature JSON:\n"
+            f"{json.dumps(user_payload, indent=2, sort_keys=True)}\n\n"
+            "Respond with JSON only using this schema:\n"
+            '{"decision":"keep|remove|uncertain","confidence":0.0,"feature_type":"door_arc|door_leaf|thin_spike|legit_mass|unclear","reason":"short explanation"}'
+        )
+
+    def _build_global_scan_prompt(
+        self,
+        *,
+        outline_payload: Dict[str, Any],
+        max_spans: int,
+    ) -> str:
+        compact_payload = _compact_outline_payload_for_llm(outline_payload)
+        system_prompt = (
+            "You are a conservative CAD exterior-boundary anomaly scanner.\n"
+            "You receive a simplified exterior boundary summary for a floor-plan footprint.\n"
+            "Your task is to identify outward spans that may be artifacts.\n"
+            "Examples include thin spikes, triangular door-leaf flaps, door-swing bulges, or small unsupported protrusions.\n"
+            "Do not flag normal footprint steps, balconies, or plausible wall offsets unless they look clearly anomalous.\n"
+            "Prefer conservative results. If unsure, return fewer spans.\n"
+            "Indices refer to the simplified_exterior_vertices list.\n"
+            "Return at most the requested number of spans.\n"
+            "Do not use markdown fences.\n"
+        )
+        return (
+            f"{system_prompt}\n"
+            "Outline summary JSON:\n"
+            f"{json.dumps(compact_payload, separators=(',', ':'), sort_keys=True)}\n\n"
+            f"Respond with JSON only using this schema (max {max_spans} items):\n"
+            '{"suspicious_spans":[{"start_idx":0,"end_idx":0,"confidence":0.0,"feature_hint":"thin_spike|door_like|triangle_flap|unclear","reason":"short explanation"}]}'
+        )
+
+    def _parse_suspicious_spans_json(self, text: str) -> List[Dict[str, Any]]:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise ValueError(f"Gemini span proposal was not valid JSON: {text!r}")
+
+        payload = json.loads(text[start:end + 1])
+        raw_spans = payload.get("suspicious_spans", [])
+        if not isinstance(raw_spans, list):
+            raise ValueError(f"Unexpected suspicious_spans payload: {raw_spans!r}")
+
+        spans: List[Dict[str, Any]] = []
+        for item in raw_spans:
+            if not isinstance(item, dict):
+                continue
+            try:
+                start_idx = int(item.get("start_idx"))
+                end_idx = int(item.get("end_idx"))
+            except (TypeError, ValueError):
+                continue
+            confidence_raw = item.get("confidence", 0.0)
+            try:
+                confidence = float(confidence_raw)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            feature_hint = str(item.get("feature_hint", "unclear")).strip().lower() or "unclear"
+            spans.append(
+                {
+                    "start_idx": start_idx,
+                    "end_idx": end_idx,
+                    "confidence": max(0.0, min(1.0, confidence)),
+                    "feature_hint": feature_hint,
+                    "reason": str(item.get("reason", "")).strip(),
+                }
+            )
+        return spans
 
 
 def maybe_apply_gemini_vision_cleanup(
@@ -191,7 +274,7 @@ def maybe_apply_gemini_vision_cleanup(
     preferred_bounds: Optional[Bounds] = None,
     judge: Optional[GeminiVisionJudge] = None,
 ) -> Tuple[Polygon, Dict[str, Any]]:
-    """Run experimental Gemini review on suspicious boundary ROIs."""
+    """Run experimental Gemini review on suspicious vector-space candidates."""
     metadata: Dict[str, Any] = {
         "enabled": False,
         "attempted": False,
@@ -203,11 +286,16 @@ def maybe_apply_gemini_vision_cleanup(
         "min_confidence": 0.0,
         "skipped_reason": None,
         "attempts": [],
+        "global_scan": {
+            "attempted": False,
+            "proposed_count": 0,
+            "accepted_count": 0,
+            "outline_summary": None,
+            "proposals": [],
+            "error": None,
+        },
     }
 
-    if cv2 is None:
-        metadata["skipped_reason"] = "cv2_unavailable"
-        return polygon, metadata
     if polygon is None or polygon.is_empty or wall_thickness <= 0:
         metadata["skipped_reason"] = "invalid_input"
         return polygon, metadata
@@ -230,18 +318,28 @@ def maybe_apply_gemini_vision_cleanup(
 
     min_confidence = float(os.getenv("GEMINI_VISION_MIN_CONFIDENCE", "0.7"))
     max_candidates = max(1, int(os.getenv("GEMINI_VISION_MAX_CANDIDATES", "6")))
+    max_global_spans = max(1, min(max_candidates, int(os.getenv("GEMINI_VISION_GLOBAL_MAX_SPANS", "5"))))
 
     metadata["enabled"] = True
     metadata["model"] = judge.model
     metadata["min_confidence"] = min_confidence
 
-    candidates = collect_vision_cleanup_candidates(
+    global_candidates, global_scan_meta = _collect_global_outline_candidates(
+        polygon=polygon,
+        wall_thickness=wall_thickness,
+        judge=judge,
+        max_candidates=max_global_spans,
+    )
+    metadata["global_scan"] = global_scan_meta
+
+    heuristic_candidates = collect_vision_cleanup_candidates(
         polygon=polygon,
         reference_segments=reference_segments,
         wall_thickness=wall_thickness,
         preferred_bounds=preferred_bounds,
         max_candidates=max_candidates,
     )
+    candidates = _merge_cleanup_candidates(global_candidates, heuristic_candidates, max_candidates=max_candidates)
     metadata["candidate_count"] = len(candidates)
     if not candidates:
         metadata["skipped_reason"] = "no_candidates"
@@ -251,19 +349,17 @@ def maybe_apply_gemini_vision_cleanup(
     current_polygon = polygon
 
     for candidate in candidates:
-        image_bytes, render_meta = render_candidate_overlay_png(
+        candidate_metrics = _candidate_feature_payload(
             polygon=current_polygon,
             reference_segments=reference_segments,
             candidate=candidate,
             wall_thickness=wall_thickness,
         )
-        candidate_metrics = _candidate_metrics(candidate)
         attempt_meta: Dict[str, Any] = {
             "kind": candidate.kind,
             "source": candidate.source,
             "bounds": [float(value) for value in candidate.bounds],
-            "render": render_meta,
-            "metrics": candidate_metrics,
+            "feature_payload": candidate_metrics,
             "decision": "keep",
             "confidence": 0.0,
             "feature_type": "unclear",
@@ -275,9 +371,8 @@ def maybe_apply_gemini_vision_cleanup(
 
         try:
             verdict = judge.judge_candidate(
-                image_bytes=image_bytes,
                 candidate=candidate,
-                metrics=candidate_metrics,
+                feature_payload=candidate_metrics,
             )
             attempt_meta.update(verdict)
         except Exception as exc:  # pragma: no cover - network path
@@ -345,81 +440,220 @@ def collect_vision_cleanup_candidates(
         if len(candidates) >= max_candidates:
             return candidates
 
-    arc_candidates = collect_cv_candidate_bounds(
-        polygon=polygon,
-        parsed_segments=reference_segments,
-        wall_thickness=wall_thickness,
-        preferred_bounds=preferred_bounds,
-        max_candidates=max_candidates,
-    )
-    for bounds in arc_candidates:
-        bounds = tuple(float(value) for value in bounds)
-        if _contains_overlapping_bounds(seen_bounds, bounds, overlap_ratio=0.55):
-            continue
-        source = "bridge_preferred" if preferred_bounds and _bounds_iou(bounds, preferred_bounds) > 0.4 else "arc_roi"
-        candidates.append(
-            VisionCleanupCandidate(
-                kind="door_like",
-                source=source,
-                bounds=bounds,
-                mask_polygon=None,
-                score_hint=_bounds_area(bounds),
-            )
-        )
-        seen_bounds.append(bounds)
-        if len(candidates) >= max_candidates:
-            break
-
     candidates.sort(key=lambda item: item.score_hint, reverse=True)
     return candidates[:max_candidates]
 
 
-def render_candidate_overlay_png(
+def _collect_global_outline_candidates(
     *,
     polygon: Polygon,
-    reference_segments: Sequence[Segment],
-    candidate: VisionCleanupCandidate,
     wall_thickness: float,
-) -> Tuple[bytes, Dict[str, Any]]:
-    padding = max(wall_thickness * 2.4, 60.0)
-    roi_segments, roi_bounds = _collect_roi_segments(reference_segments, candidate.bounds, padding=padding)
-    render_bounds = _expand_bounds(candidate.bounds, padding)
-
-    width_mm = max(render_bounds[2] - render_bounds[0], 1.0)
-    height_mm = max(render_bounds[3] - render_bounds[1], 1.0)
-    target_dimension_px = 720.0
-    resolution = max(width_mm, height_mm) / target_dimension_px
-    resolution = max(1.5, min(8.0, resolution))
-
-    width_px = max(160, int(math.ceil(width_mm / resolution)) + 12)
-    height_px = max(160, int(math.ceil(height_mm / resolution)) + 12)
-    image = np.full((height_px, width_px, 3), 255, dtype=np.uint8)
-
-    for segment in roi_segments:
-        start = _world_to_pixel(segment.start.to_2d(), render_bounds, resolution, height_px, width_px)
-        end = _world_to_pixel(segment.end.to_2d(), render_bounds, resolution, height_px, width_px)
-        cv2.line(image, start, end, color=(175, 175, 175), thickness=2, lineType=cv2.LINE_AA)
-
-    if candidate.mask_polygon is not None:
-        _fill_polygon(image, candidate.mask_polygon, render_bounds, resolution, color=(255, 240, 170))
-        _stroke_polygon(image, candidate.mask_polygon, render_bounds, resolution, color=(0, 200, 220), thickness=3)
-    else:
-        _draw_bounds(image, candidate.bounds, render_bounds, resolution, color=(0, 200, 220), thickness=3)
-
-    _stroke_polygon(image, polygon, render_bounds, resolution, color=(50, 60, 225), thickness=4)
-    _draw_bounds(image, candidate.bounds, render_bounds, resolution, color=(215, 110, 30), thickness=2)
-
-    success, encoded = cv2.imencode(".png", image)
-    if not success:  # pragma: no cover - cv2 runtime failure
-        raise RuntimeError("Failed to encode Gemini ROI overlay image")
-
-    return encoded.tobytes(), {
-        "roi_bounds": [float(value) for value in render_bounds],
-        "roi_segment_count": len(roi_segments),
-        "resolution_mm_per_px": resolution,
-        "width_px": width_px,
-        "height_px": height_px,
+    judge: Any,
+    max_candidates: int,
+) -> Tuple[List[VisionCleanupCandidate], Dict[str, Any]]:
+    metadata: Dict[str, Any] = {
+        "attempted": False,
+        "proposed_count": 0,
+        "accepted_count": 0,
+        "outline_summary": None,
+        "proposals": [],
+        "error": None,
     }
+    if max_candidates <= 0 or polygon is None or polygon.is_empty:
+        return [], metadata
+
+    if not hasattr(judge, "propose_suspicious_spans"):
+        metadata["error"] = "judge_missing_global_scan_method"
+        return [], metadata
+
+    outline_summary = _build_outline_scan_payload(polygon=polygon, wall_thickness=wall_thickness)
+    metadata["outline_summary"] = outline_summary
+    metadata["attempted"] = True
+
+    try:
+        proposals = judge.propose_suspicious_spans(
+            outline_payload=outline_summary,
+            max_spans=max_candidates,
+        )
+    except Exception as exc:  # pragma: no cover - network path
+        logger.warning("Gemini global outline scan skipped: %s", exc)
+        metadata["error"] = str(exc)
+        return [], metadata
+
+    metadata["proposed_count"] = len(proposals)
+    metadata["proposals"] = proposals
+    candidates: List[VisionCleanupCandidate] = []
+    seen_bounds: List[Bounds] = []
+    simplified_vertices = outline_summary["simplified_exterior_vertices"]
+    world_origin = tuple(float(value) for value in outline_summary["world_origin"])
+
+    for proposal in proposals:
+        candidate = _candidate_from_outline_proposal(
+            proposal=proposal,
+            simplified_vertices=simplified_vertices,
+            world_origin=world_origin,
+            wall_thickness=wall_thickness,
+        )
+        if candidate is None:
+            continue
+        if _contains_overlapping_bounds(seen_bounds, candidate.bounds, overlap_ratio=0.55):
+            continue
+        candidates.append(candidate)
+        seen_bounds.append(candidate.bounds)
+        if len(candidates) >= max_candidates:
+            break
+
+    metadata["accepted_count"] = len(candidates)
+    return candidates, metadata
+
+
+def _build_outline_scan_payload(
+    *,
+    polygon: Polygon,
+    wall_thickness: float,
+    max_vertices: int = 180,
+) -> Dict[str, Any]:
+    simplified_coords, tolerance = _simplify_outline_vertices(
+        polygon=polygon,
+        wall_thickness=wall_thickness,
+        max_vertices=max_vertices,
+    )
+    min_x, min_y, max_x, max_y = polygon.bounds
+    width = max_x - min_x
+    height = max_y - min_y
+    return {
+        "world_origin": [float(min_x), float(min_y)],
+        "local_bbox": [0.0, 0.0, float(width), float(height)],
+        "world_bbox": [float(min_x), float(min_y), float(max_x), float(max_y)],
+        "area_mm2": float(polygon.area),
+        "perimeter_mm": float(polygon.length),
+        "wall_thickness_mm": float(wall_thickness),
+        "original_vertex_count": max(0, len(polygon.exterior.coords) - 1),
+        "simplified_vertex_count": len(simplified_coords),
+        "simplify_tolerance_mm": float(tolerance),
+        "simplified_exterior_vertices": [
+            {"i": index, "x": float(x - min_x), "y": float(y - min_y)}
+            for index, (x, y) in enumerate(simplified_coords)
+        ],
+    }
+
+
+def _simplify_outline_vertices(
+    *,
+    polygon: Polygon,
+    wall_thickness: float,
+    max_vertices: int,
+) -> Tuple[List[Tuple[float, float]], float]:
+    diagonal = math.hypot(
+        polygon.bounds[2] - polygon.bounds[0],
+        polygon.bounds[3] - polygon.bounds[1],
+    )
+    tolerance = max(wall_thickness * 0.15, diagonal * 0.001, 4.0)
+    max_tolerance = max(wall_thickness * 4.0, diagonal * 0.04, tolerance)
+    exterior = polygon.exterior
+
+    while True:
+        simplified = exterior.simplify(tolerance, preserve_topology=False)
+        coords = [(float(x), float(y)) for x, y in simplified.coords[:-1]]
+        if len(coords) < 3:
+            coords = [(float(x), float(y)) for x, y in exterior.coords[:-1]]
+        if len(coords) <= max_vertices or tolerance >= max_tolerance:
+            return coords, tolerance
+        tolerance *= 1.5
+
+
+def _compact_outline_payload_for_llm(outline_payload: Dict[str, Any]) -> Dict[str, Any]:
+    vertices = outline_payload.get("simplified_exterior_vertices", [])
+    return {
+        "local_bbox": [round(float(value), 1) for value in outline_payload.get("local_bbox", [0.0, 0.0, 0.0, 0.0])],
+        "area_mm2": round(float(outline_payload.get("area_mm2", 0.0)), 1),
+        "perimeter_mm": round(float(outline_payload.get("perimeter_mm", 0.0)), 1),
+        "wall_thickness_mm": round(float(outline_payload.get("wall_thickness_mm", 0.0)), 1),
+        "simplified_vertex_count": int(outline_payload.get("simplified_vertex_count", len(vertices))),
+        "simplified_exterior_vertices": [
+            {
+                "i": int(vertex["i"]),
+                "x": round(float(vertex["x"]), 1),
+                "y": round(float(vertex["y"]), 1),
+            }
+            for vertex in vertices
+        ],
+    }
+
+
+def _candidate_from_outline_proposal(
+    *,
+    proposal: Dict[str, Any],
+    simplified_vertices: Sequence[Dict[str, float]],
+    world_origin: Tuple[float, float],
+    wall_thickness: float,
+) -> Optional[VisionCleanupCandidate]:
+    if not simplified_vertices:
+        return None
+
+    try:
+        start_idx = int(proposal["start_idx"])
+        end_idx = int(proposal["end_idx"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    if start_idx < 0 or end_idx < 0 or start_idx >= len(simplified_vertices) or end_idx >= len(simplified_vertices):
+        return None
+    if end_idx < start_idx:
+        start_idx, end_idx = end_idx, start_idx
+
+    span_vertices = simplified_vertices[start_idx : end_idx + 1]
+    if len(span_vertices) < 2:
+        return None
+
+    origin_x, origin_y = world_origin
+    xs = [vertex["x"] + origin_x for vertex in span_vertices]
+    ys = [vertex["y"] + origin_y for vertex in span_vertices]
+    padding = max(wall_thickness * 1.4, 20.0)
+    bounds = (
+        float(min(xs) - padding),
+        float(min(ys) - padding),
+        float(max(xs) + padding),
+        float(max(ys) + padding),
+    )
+    feature_hint = str(proposal.get("feature_hint", "unclear")).strip().lower()
+    kind = "door_like" if "door" in feature_hint else "outline_suspect"
+    confidence = float(proposal.get("confidence", 0.0) or 0.0)
+    span_length = 0.0
+    for left, right in zip(span_vertices, span_vertices[1:]):
+        span_length += math.hypot(right["x"] - left["x"], right["y"] - left["y"])
+
+    return VisionCleanupCandidate(
+        kind=kind,
+        source="global_outline_scan",
+        bounds=bounds,
+        mask_polygon=None,
+        score_hint=max(span_length, _bounds_area(bounds)) * max(confidence, 0.25),
+        span_start_idx=start_idx,
+        span_end_idx=end_idx,
+        span_reason=str(proposal.get("reason", "")).strip(),
+        span_confidence=max(0.0, min(1.0, confidence)),
+    )
+
+
+def _merge_cleanup_candidates(
+    global_candidates: Sequence[VisionCleanupCandidate],
+    heuristic_candidates: Sequence[VisionCleanupCandidate],
+    *,
+    max_candidates: int,
+) -> List[VisionCleanupCandidate]:
+    merged: List[VisionCleanupCandidate] = []
+    seen_bounds: List[Bounds] = []
+    for candidate in list(global_candidates) + list(heuristic_candidates):
+        if _contains_overlapping_bounds(seen_bounds, candidate.bounds, overlap_ratio=0.55):
+            continue
+        merged.append(candidate)
+        seen_bounds.append(candidate.bounds)
+        if len(merged) >= max_candidates:
+            break
+
+    merged.sort(key=lambda item: item.score_hint, reverse=True)
+    return merged[:max_candidates]
 
 
 def _collect_opening_delta_features(
@@ -579,80 +813,148 @@ def _evaluate_cleanup_result(
     }
 
 
-def _candidate_metrics(candidate: VisionCleanupCandidate) -> Dict[str, float]:
-    width = candidate.bounds[2] - candidate.bounds[0]
-    height = candidate.bounds[3] - candidate.bounds[1]
-    area = candidate.mask_polygon.area if candidate.mask_polygon is not None else _bounds_area(candidate.bounds)
+def _candidate_feature_payload(
+    *,
+    polygon: Polygon,
+    reference_segments: Sequence[Segment],
+    candidate: VisionCleanupCandidate,
+    wall_thickness: float,
+) -> Dict[str, Any]:
+    width = max(candidate.bounds[2] - candidate.bounds[0], 0.0)
+    height = max(candidate.bounds[3] - candidate.bounds[1], 0.0)
+    bbox_area = _bounds_area(candidate.bounds)
+    candidate_area = candidate.mask_polygon.area if candidate.mask_polygon is not None else bbox_area
+    min_dim = min(width, height)
+    max_dim = max(width, height)
+
+    payload: Dict[str, Any] = {
+        "candidate_kind": candidate.kind,
+        "candidate_source": candidate.source,
+        "candidate_bounds": [float(value) for value in candidate.bounds],
+        "global_span_start_idx": candidate.span_start_idx,
+        "global_span_end_idx": candidate.span_end_idx,
+        "global_span_reason": candidate.span_reason,
+        "global_span_confidence": float(candidate.span_confidence),
+        "wall_thickness_mm": float(wall_thickness),
+        "width_mm": float(width),
+        "height_mm": float(height),
+        "min_dim_mm": float(min_dim),
+        "max_dim_mm": float(max_dim),
+        "bbox_area_mm2": float(bbox_area),
+        "candidate_area_mm2": float(candidate_area),
+        "aspect_ratio": float(max_dim / max(min_dim, 1e-6)),
+        "min_dim_to_wall_ratio": float(min_dim / max(wall_thickness, 1e-6)),
+        "max_dim_to_wall_ratio": float(max_dim / max(wall_thickness, 1e-6)),
+        "candidate_area_ratio_of_polygon": float(candidate_area / max(polygon.area, 1e-6)),
+        "candidate_bbox_area_ratio_of_polygon_bbox": float(bbox_area / max(_bbox_area(polygon.bounds), 1e-6)),
+    }
+
+    if candidate.mask_polygon is not None and not candidate.mask_polygon.is_empty:
+        payload.update(_mask_polygon_features(candidate.mask_polygon, wall_thickness))
+
+    payload.update(
+        _roi_segment_features(
+            reference_segments=reference_segments,
+            bounds=candidate.bounds,
+            wall_thickness=wall_thickness,
+        )
+    )
+    return payload
+
+
+def _mask_polygon_features(mask_polygon: Polygon, wall_thickness: float) -> Dict[str, Any]:
+    perimeter = mask_polygon.length
+    hull = mask_polygon.convex_hull
+    hull_area = hull.area if not hull.is_empty else 0.0
+    min_rect = mask_polygon.minimum_rotated_rectangle
+    rect_coords = list(min_rect.exterior.coords)
+    rect_sides = []
+    for start, end in zip(rect_coords, rect_coords[1:]):
+        rect_sides.append(math.hypot(end[0] - start[0], end[1] - start[1]))
+    unique_sides = sorted({round(side, 6) for side in rect_sides if side > 1e-6})
+    rect_min_dim = unique_sides[0] if unique_sides else 0.0
+    rect_max_dim = unique_sides[-1] if unique_sides else 0.0
+
     return {
-        "width_mm": width,
-        "height_mm": height,
-        "area_mm2": area,
-        "aspect_ratio": max(width, height) / max(min(width, height), 1e-6),
+        "mask_area_mm2": float(mask_polygon.area),
+        "mask_perimeter_mm": float(perimeter),
+        "mask_vertex_count": max(0, len(mask_polygon.exterior.coords) - 1),
+        "mask_convex_hull_ratio": float(mask_polygon.area / max(hull_area, 1e-6)),
+        "mask_bbox_fill_ratio": float(mask_polygon.area / max(_bounds_area(mask_polygon.bounds), 1e-6)),
+        "mask_rect_min_dim_mm": float(rect_min_dim),
+        "mask_rect_max_dim_mm": float(rect_max_dim),
+        "mask_rect_aspect_ratio": float(rect_max_dim / max(rect_min_dim, 1e-6)),
+        "neck_width_mm": float(rect_min_dim),
+        "neck_width_to_wall_ratio": float(rect_min_dim / max(wall_thickness, 1e-6)),
+        "compactness": float((perimeter * perimeter) / max(mask_polygon.area, 1e-6)),
+        "is_triangle_like": bool(max(0, len(mask_polygon.exterior.coords) - 1) <= 4),
     }
 
 
-def _fill_polygon(
-    image: np.ndarray,
-    polygon: Polygon,
-    roi_bounds: Bounds,
-    resolution: float,
+def _roi_segment_features(
     *,
-    color: Tuple[int, int, int],
-) -> None:
-    points = _polygon_to_cv_points(polygon.exterior.coords, roi_bounds, resolution, image.shape[0], image.shape[1])
-    if points is None:
-        return
-    overlay = image.copy()
-    cv2.fillPoly(overlay, [points], color=color)
-    cv2.addWeighted(overlay, 0.35, image, 0.65, 0.0, dst=image)
-
-
-def _stroke_polygon(
-    image: np.ndarray,
-    polygon: Polygon,
-    roi_bounds: Bounds,
-    resolution: float,
-    *,
-    color: Tuple[int, int, int],
-    thickness: int,
-) -> None:
-    points = _polygon_to_cv_points(polygon.exterior.coords, roi_bounds, resolution, image.shape[0], image.shape[1])
-    if points is not None:
-        cv2.polylines(image, [points], isClosed=True, color=color, thickness=thickness, lineType=cv2.LINE_AA)
-    for interior in polygon.interiors:
-        inner_points = _polygon_to_cv_points(interior.coords, roi_bounds, resolution, image.shape[0], image.shape[1])
-        if inner_points is not None:
-            cv2.polylines(image, [inner_points], isClosed=True, color=color, thickness=max(1, thickness - 1), lineType=cv2.LINE_AA)
-
-
-def _draw_bounds(
-    image: np.ndarray,
+    reference_segments: Sequence[Segment],
     bounds: Bounds,
-    roi_bounds: Bounds,
-    resolution: float,
-    *,
-    color: Tuple[int, int, int],
-    thickness: int,
-) -> None:
-    top_left = _world_to_pixel((bounds[0], bounds[3]), roi_bounds, resolution, image.shape[0], image.shape[1])
-    bottom_right = _world_to_pixel((bounds[2], bounds[1]), roi_bounds, resolution, image.shape[0], image.shape[1])
-    cv2.rectangle(image, top_left, bottom_right, color=color, thickness=thickness, lineType=cv2.LINE_AA)
+    wall_thickness: float,
+) -> Dict[str, Any]:
+    padding = max(wall_thickness * 1.8, 40.0)
+    roi_segments, roi_bounds = _collect_roi_segments(reference_segments, bounds, padding=padding)
+    segment_lengths = [segment.length() for segment in roi_segments]
+    horizontal_count = 0
+    vertical_count = 0
+    diagonal_count = 0
+    arc_radii: List[float] = []
+    arc_sweeps: List[float] = []
+    unique_arc_groups = set()
 
+    for segment in roi_segments:
+        dx = segment.end.x - segment.start.x
+        dy = segment.end.y - segment.start.y
+        angle_deg = abs(math.degrees(math.atan2(dy, dx))) % 180.0
+        if angle_deg <= 12.0 or angle_deg >= 168.0:
+            horizontal_count += 1
+        elif 78.0 <= angle_deg <= 102.0:
+            vertical_count += 1
+        else:
+            diagonal_count += 1
 
-def _polygon_to_cv_points(
-    coords,
-    roi_bounds: Bounds,
-    resolution: float,
-    height_px: int,
-    width_px: int,
-) -> Optional[np.ndarray]:
-    points = [
-        _world_to_pixel((float(x), float(y)), roi_bounds, resolution, height_px, width_px)
-        for x, y in coords
-    ]
-    if len(points) < 3:
-        return None
-    return np.array(points, dtype=np.int32)
+        meta = segment.meta or {}
+        segment_type = str(meta.get("type", "")).lower()
+        if segment_type == "arc":
+            radius = meta.get("radius")
+            sweep = meta.get("sweep_angle_deg")
+            group_id = meta.get("arc_group_id")
+            if radius is not None:
+                try:
+                    arc_radii.append(float(radius))
+                except (TypeError, ValueError):
+                    pass
+            if sweep is not None:
+                try:
+                    arc_sweeps.append(float(sweep))
+                except (TypeError, ValueError):
+                    pass
+            if group_id is not None:
+                unique_arc_groups.add(group_id)
+
+    total_segments = len(roi_segments)
+    total_length = sum(segment_lengths)
+    return {
+        "roi_bounds": [float(value) for value in roi_bounds],
+        "roi_segment_count": total_segments,
+        "roi_total_segment_length_mm": float(total_length),
+        "roi_longest_segment_mm": float(max(segment_lengths) if segment_lengths else 0.0),
+        "roi_median_segment_length_mm": float(median(segment_lengths) if segment_lengths else 0.0),
+        "roi_horizontal_segment_count": horizontal_count,
+        "roi_vertical_segment_count": vertical_count,
+        "roi_diagonal_segment_count": diagonal_count,
+        "roi_axis_aligned_ratio": float((horizontal_count + vertical_count) / max(total_segments, 1)),
+        "roi_arc_segment_count": len(arc_radii),
+        "roi_arc_group_count": len(unique_arc_groups),
+        "roi_arc_radius_median_mm": float(median(arc_radii) if arc_radii else 0.0),
+        "roi_arc_sweep_median_deg": float(median(arc_sweeps) if arc_sweeps else 0.0),
+        "roi_has_door_arc_signal": bool(arc_radii and arc_sweeps),
+    }
 
 
 def _collect_polygons(geometry) -> List[Polygon]:
@@ -683,6 +985,60 @@ def _bounds_iou(left: Bounds, right: Bounds) -> float:
     if union_area <= 0:
         return 0.0
     return left_box.intersection(right_box).area / union_area
+
+
+def _collect_roi_segments(
+    segments: Sequence[Segment],
+    bounds: Bounds,
+    padding: float,
+) -> Tuple[List[Segment], Bounds]:
+    roi_bounds = _expand_bounds(bounds, padding)
+    roi_segments = [segment for segment in segments if _segment_overlaps_bounds(segment, roi_bounds)]
+    return roi_segments, roi_bounds
+
+
+def _expand_bounds(bounds: Bounds, padding: float) -> Bounds:
+    return (
+        bounds[0] - padding,
+        bounds[1] - padding,
+        bounds[2] + padding,
+        bounds[3] + padding,
+    )
+
+
+def _segment_overlaps_bounds(segment: Segment, bounds: Bounds) -> bool:
+    return _bounds_intersect(
+        (
+            min(segment.start.x, segment.end.x),
+            min(segment.start.y, segment.end.y),
+            max(segment.start.x, segment.end.x),
+            max(segment.start.y, segment.end.y),
+        ),
+        bounds,
+    )
+
+
+def _bounds_intersect(left: Bounds, right: Bounds) -> bool:
+    return not (
+        left[2] < right[0]
+        or left[0] > right[2]
+        or left[3] < right[1]
+        or left[1] > right[3]
+    )
+
+
+def _select_polygon(geometry) -> Optional[Polygon]:
+    if geometry is None or geometry.is_empty:
+        return None
+    if isinstance(geometry, Polygon):
+        return geometry
+    if isinstance(geometry, MultiPolygon):
+        return max(geometry.geoms, key=lambda geom: geom.area)
+    if isinstance(geometry, GeometryCollection):
+        polygons = [geom for geom in geometry.geoms if isinstance(geom, Polygon)]
+        if polygons:
+            return max(polygons, key=lambda geom: geom.area)
+    return None
 
 
 def _bounds_area(bounds: Bounds) -> float:

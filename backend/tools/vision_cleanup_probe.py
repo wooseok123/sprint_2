@@ -13,17 +13,17 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from env_utils import load_backend_env
 from core.graph import GraphProcessor
 from core.noding import NodingProcessor
 from core.outline import OutlineExtractorV2
-from core.outline_cv_fallback import apply_cv_door_fallback, collect_cv_candidate_bounds
 from core.parser import DXFParser
 from core.preprocess import DXFPreprocessor
 from core.validate import BoundaryValidator
 from core.vision_cleanup import (
+    _candidate_feature_payload,
     collect_vision_cleanup_candidates,
     maybe_apply_gemini_vision_cleanup,
-    render_candidate_overlay_png,
 )
 
 
@@ -45,6 +45,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    load_backend_env()
     args = parse_args()
     dxf_path = args.dxf_path.resolve()
     output_dir = args.output_dir.resolve()
@@ -81,29 +82,6 @@ def main() -> int:
         else None
     )
 
-    cv_bounds = collect_cv_candidate_bounds(
-        polygon=polygon,
-        parsed_segments=parsed.segments,
-        wall_thickness=outline_metadata.get("estimated_wall_thickness", 0.0),
-        preferred_bounds=preferred_bounds,
-    )
-    cv_attempts = []
-    for index, bounds in enumerate(cv_bounds):
-        attempt_polygon, attempt_meta = apply_cv_door_fallback(
-            polygon=polygon,
-            parsed_segments=parsed.segments,
-            candidate_bounds=tuple(bounds),
-            wall_thickness=outline_metadata.get("estimated_wall_thickness", 0.0),
-        )
-        cv_attempts.append(
-            {
-                "index": index,
-                "bounds": list(bounds),
-                "applied": attempt_polygon is not None,
-                "metadata": attempt_meta,
-            }
-        )
-
     vision_candidates = collect_vision_cleanup_candidates(
         polygon=polygon,
         reference_segments=preprocessed.segments,
@@ -112,22 +90,18 @@ def main() -> int:
     )
     candidate_summaries = []
     for index, candidate in enumerate(vision_candidates):
-        image_bytes, render_meta = render_candidate_overlay_png(
-            polygon=polygon,
-            reference_segments=preprocessed.segments,
-            candidate=candidate,
-            wall_thickness=outline_metadata.get("estimated_wall_thickness", 0.0),
-        )
-        image_path = output_dir / f"candidate_{index:02d}_{candidate.kind}.png"
-        image_path.write_bytes(image_bytes)
         candidate_summaries.append(
             {
                 "index": index,
                 "kind": candidate.kind,
                 "source": candidate.source,
                 "bounds": list(candidate.bounds),
-                "image_path": str(image_path),
-                "render": render_meta,
+                "feature_payload": _candidate_feature_payload(
+                    polygon=polygon,
+                    reference_segments=preprocessed.segments,
+                    candidate=candidate,
+                    wall_thickness=outline_metadata.get("estimated_wall_thickness", 0.0),
+                ),
             }
         )
 
@@ -160,7 +134,6 @@ def main() -> int:
             "outline_input_segments": len(pruned_segments),
         },
         "outline_extraction": outline_metadata,
-        "cv_attempts": cv_attempts,
         "vision_candidates": candidate_summaries,
         "gemini_cleanup": gemini_cleanup,
         "validated_boundary": {

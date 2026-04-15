@@ -212,10 +212,6 @@ async def detect_boundary(file: UploadFile = File(...)):
             from core.cycles import CycleDetector
             from core.filter import AreaFilter
             from core.outline import OutlineExtractorV2
-            from core.outline_cv_fallback import (
-                apply_cv_door_fallback,
-                collect_cv_candidate_bounds,
-            )
             from core.vision_cleanup import maybe_apply_gemini_vision_cleanup
             from core.union import BoundaryExtractor
             from core.validate import BoundaryValidator
@@ -368,53 +364,6 @@ async def detect_boundary(file: UploadFile = File(...)):
                     if merge_metadata.get("bridge_last_candidate_bounds")
                     else None
                 )
-                cv_candidate_bounds = collect_cv_candidate_bounds(
-                    polygon=merged_polygon,
-                    parsed_segments=parsed.segments,
-                    wall_thickness=merge_metadata.get("estimated_wall_thickness", 0.0),
-                    preferred_bounds=preferred_bounds,
-                )
-                cv_fallback_metadata = {
-                    "attempted": False,
-                    "applied": False,
-                    "applied_count": 0,
-                    "candidate_count": len(cv_candidate_bounds),
-                    "candidate_bounds": [list(bounds) for bounds in cv_candidate_bounds],
-                    "attempts": [],
-                    "detection_reason": "no_candidates",
-                }
-
-                for candidate_bounds in cv_candidate_bounds:
-                    attempt_polygon, attempt_metadata = apply_cv_door_fallback(
-                        polygon=merged_polygon,
-                        parsed_segments=parsed.segments,
-                        candidate_bounds=tuple(candidate_bounds),
-                        wall_thickness=merge_metadata.get("estimated_wall_thickness", 0.0),
-                    )
-                    cv_fallback_metadata["attempted"] = True
-                    cv_fallback_metadata["attempts"].append(attempt_metadata)
-                    cv_fallback_metadata["detection_reason"] = attempt_metadata.get("detection_reason")
-
-                    if attempt_polygon is None:
-                        continue
-
-                    merged_polygon = attempt_polygon
-                    cv_fallback_metadata["applied"] = True
-                    cv_fallback_metadata["applied_count"] += 1
-                    logger.info(
-                        "Applied OpenCV door fallback: "
-                        f"roi_segments={attempt_metadata.get('roi_segment_count', 0)} "
-                        f"frame_segments={attempt_metadata.get('frame_segment_count', 0)} "
-                        f"score={attempt_metadata.get('detection_score', 0.0):.3f}"
-                    )
-
-                if not cv_candidate_bounds and preferred_bounds is None:
-                    cv_fallback_metadata["detection_reason"] = "no_candidates"
-                elif not cv_fallback_metadata["attempted"]:
-                    cv_fallback_metadata["detection_reason"] = "trigger_not_met"
-
-                merge_metadata["cv_fallback"] = cv_fallback_metadata
-
                 merged_polygon, vision_cleanup_metadata = maybe_apply_gemini_vision_cleanup(
                     polygon=merged_polygon,
                     reference_segments=preprocessed.segments,
