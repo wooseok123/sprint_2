@@ -8,41 +8,61 @@
 // Use relative URL for Vite proxy, fallback to direct connection
 const API_BASE_URL = '/api' // Will be proxied to http://localhost:8000/api
 const DETECT_ENDPOINT = `${API_BASE_URL}/detect-boundary`
+const PREPROCESS_ENDPOINT = `${API_BASE_URL}/preprocess-dxf`
+
+async function postDxfFile(endpoint, dxfFile) {
+  const formData = new FormData()
+  formData.append('file', dxfFile)
+
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    body: formData
+  })
+
+  if (!response.ok) {
+    throw new Error(`HTTP error! status: ${response.status}`)
+  }
+
+  const data = await response.json()
+  if (!data.success) {
+    throw new Error(data.error || 'DXF processing failed')
+  }
+
+  return data
+}
+
+export async function preprocessDrawing(dxfFile) {
+  try {
+    const data = await postDxfFile(PREPROCESS_ENDPOINT, dxfFile)
+    return {
+      preprocessed: data.preprocessed,
+      metadata: data.metadata
+    }
+  } catch (error) {
+    if (error.name === 'TypeError' && error.message.includes('fetch')) {
+      throw new Error(
+        'Cannot connect to backend server. Make sure the server is running at http://localhost:8000'
+      )
+    }
+    throw error
+  }
+}
 
 /**
  * Detects the outer boundary in a DXF file
  *
  * @param {File} dxfFile - The DXF file to process
- * @returns {Promise<{boundary: {exterior: number[][], interiors: number[][][]}, metadata: object}>}
+ * @returns {Promise<{boundary: {exterior: number[][], interiors: number[][][]}, preprocessed: {segments: number[][][]}, metadata: object}>}
  * @throws {Error} If the API request fails or returns an error
  */
 export async function detectBoundary(dxfFile) {
   try {
-    // Create FormData for multipart/form-data upload
-    const formData = new FormData()
-    formData.append('file', dxfFile)
-
-    // Send POST request to backend
-    const response = await fetch(DETECT_ENDPOINT, {
-      method: 'POST',
-      body: formData,
-      // Don't set Content-Type header - let the browser set it with the correct boundary
-    })
-
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`)
-    }
-
-    const data = await response.json()
-
-    // Check if the API reports success
-    if (!data.success) {
-      throw new Error(data.error || 'Boundary detection failed')
-    }
+    const data = await postDxfFile(DETECT_ENDPOINT, dxfFile)
 
     // Return the boundary data and metadata
     return {
       boundary: data.boundary, // { exterior: [[x,y]...], interiors: [[[x,y]...], ...] }
+      preprocessed: data.preprocessed, // { segments: [[[x1,y1],[x2,y2]], ...] }
       metadata: data.metadata // { area, confidence, processing_time_ms, ... }
     }
   } catch (error) {

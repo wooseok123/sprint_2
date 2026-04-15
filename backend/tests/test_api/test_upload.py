@@ -39,6 +39,16 @@ class TestFileUploadEndpoint:
         assert response.status_code == 400
         assert "Invalid file format" in response.json()["detail"]
 
+    def test_preprocess_upload_non_dxf_file(self):
+        """Test uploading non-DXF file to preprocess endpoint returns 400."""
+        file_content = b"This is not a DXF file"
+        files = {"file": ("test.txt", io.BytesIO(file_content), "text/plain")}
+
+        response = client.post("/api/preprocess-dxf", files=files)
+
+        assert response.status_code == 400
+        assert "Invalid file format" in response.json()["detail"]
+
     def test_upload_empty_file(self):
         """Test uploading empty file."""
         file_content = b""

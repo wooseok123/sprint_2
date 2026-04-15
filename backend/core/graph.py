@@ -1,15 +1,18 @@
 """
 Graph Construction and Pruning (STEP 4-5)
-Implements tolerance snapping with KD-tree + Union-Find, and dangling edge pruning
+Implements tolerance snapping with KD-tree + Union-Find, and dangling edge pruning.
 """
 import math
 import logging
 from statistics import median
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Iterable, Set
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.spatial import KDTree
+try:
+    from scipy.spatial import KDTree
+except ImportError:  # pragma: no cover - optional runtime acceleration
+    KDTree = None
 import networkx as nx
 from shapely.geometry import LineString, box
 from shapely.strtree import STRtree
@@ -67,11 +70,13 @@ class GraphProcessor:
             'corridor_padding_ratio': 0.15,
             'max_extension_segments': 50000,
             'max_extension_dangling_nodes': 4000,
+            'terminal_branch_length_ratio': 12.0,
         }
         self.adaptive_params = {**default_params, **(adaptive_params or {})}
 
         self.tolerance = None
         self.graph = None
+        self.latest_segments: List[Segment] = []
         self.extension_metadata = {
             "attempted": False,
             "applied_count": 0,
@@ -120,6 +125,7 @@ class GraphProcessor:
         self.graph = self._build_graph(snapped_segments)
 
         logger.info(f"Graph built: {self.graph.number_of_nodes()} nodes, {self.graph.number_of_edges()} edges")
+        self.latest_segments = snapped_segments
 
         return self.graph, snapped_segments
 
@@ -142,7 +148,13 @@ class GraphProcessor:
         iteration = 0
         total_pruned = 0
         max_prune_percent = 10.0
+        max_prunable_edges = max(1, int(math.ceil(initial_edges * max_prune_percent / 100.0))) if initial_edges > 0 else 0
         spur_length_limit = self._calculate_spur_length_limit()
+        wall_thickness, _ = self._estimate_wall_thickness(self.latest_segments) if self.latest_segments else (0.0, "unavailable")
+        terminal_branch_length_limit = max(
+            spur_length_limit,
+            wall_thickness * self.adaptive_params["terminal_branch_length_ratio"],
+        )
 
         while iteration < max_iterations:
             dangling_nodes = []
@@ -152,7 +164,13 @@ class GraphProcessor:
 
                 neighbor = next(iter(self.graph.neighbors(node)))
                 edge_data = self.graph.get_edge_data(node, neighbor) or {}
-                if edge_data.get('length', float('inf')) <= spur_length_limit:
+                edge_length = edge_data.get('length', float('inf'))
+                if edge_length <= spur_length_limit or self._is_terminal_branch_candidate(
+                    node,
+                    neighbor,
+                    edge_length,
+                    terminal_branch_length_limit,
+                ):
                     dangling_nodes.append(node)
 
             if not dangling_nodes:
@@ -162,16 +180,20 @@ class GraphProcessor:
                 logger.warning("Graph too small (<4 nodes), stopping pruning")
                 break
 
-            edges_to_remove = sum(self.graph.degree(n) for n in dangling_nodes)
+            edges_to_remove = len({
+                tuple(sorted((node, next(iter(self.graph.neighbors(node))))))
+                for node in dangling_nodes
+                if self.graph.degree(node) == 1
+            })
             projected_pruned = total_pruned + edges_to_remove
             projected_percent = (
                 projected_pruned / initial_edges * 100
                 if initial_edges > 0 else 0
             )
-            if projected_percent > max_prune_percent:
+            if projected_pruned > max_prunable_edges:
                 logger.warning(
                     f"Stopping pruning at projected {projected_percent:.1f}% edge removal "
-                    f"(limit {max_prune_percent:.1f}%)"
+                    f"(limit {max_prune_percent:.1f}% / {max_prunable_edges} edges)"
                 )
                 break
 
@@ -222,6 +244,26 @@ class GraphProcessor:
 
         return metrics
 
+    def get_active_segments(self, segments: List[Segment]) -> List[Segment]:
+        """
+        Return the segments whose edges still exist in the current graph.
+
+        This lets downstream stages consume the pruned graph structure rather
+        than the original snapped segment list.
+        """
+        if self.graph is None:
+            raise ValueError("Graph not built. Call build_graph_and_snap first.")
+
+        if not segments:
+            return []
+
+        active_indices = {
+            data["index"]
+            for _, _, data in self.graph.edges(data=True)
+            if data.get("index") is not None
+        }
+        return [segment for index, segment in enumerate(segments) if index in active_indices]
+
     def _calculate_spur_length_limit(self) -> float:
         """
         Compute a conservative maximum length for removable dangling spurs.
@@ -236,6 +278,55 @@ class GraphProcessor:
         avg_length = sum(edge_lengths) / len(edge_lengths) if edge_lengths else 0.0
 
         return max(self.tolerance * 5, avg_length * 0.1)
+
+    def _is_terminal_branch_candidate(
+        self,
+        node: Tuple[float, float],
+        attachment: Tuple[float, float],
+        branch_length: float,
+        length_limit: float,
+    ) -> bool:
+        """
+        Detect a dead-end branch that meets a longer run as a T-junction.
+
+        This catches thin protrusions that are longer than the generic short-spur
+        limit but still look like non-boundary branches.
+        """
+        if self.graph is None:
+            return False
+        if branch_length > length_limit:
+            return False
+        if self.graph.degree(attachment) < 3:
+            return False
+
+        branch_angle = self._edge_angle(node, attachment)
+        if branch_angle is None:
+            return False
+
+        neighbor_edges = []
+        for other in self.graph.neighbors(attachment):
+            if other == node:
+                continue
+            angle = self._edge_angle(attachment, other)
+            edge_data = self.graph.get_edge_data(attachment, other) or {}
+            if angle is None:
+                continue
+            neighbor_edges.append((angle, edge_data.get("length", 0.0)))
+
+        if len(neighbor_edges) < 2:
+            return False
+
+        for index, (left_angle, left_length) in enumerate(neighbor_edges):
+            for right_angle, right_length in neighbor_edges[index + 1:]:
+                if not self._is_parallel(left_angle, right_angle):
+                    continue
+                if not self._is_orthogonal(branch_angle, left_angle):
+                    continue
+                if min(left_length, right_length) < branch_length * 0.75:
+                    continue
+                return True
+
+        return False
 
     def _calculate_adaptive_tolerance(self, segments: List[Segment]) -> float:
         """
@@ -353,7 +444,12 @@ class GraphProcessor:
     ) -> Dict:
         nodes = list(graph.nodes)
         node_array = np.array(nodes, dtype=float) if nodes else np.empty((0, 2), dtype=float)
-        endpoint_tree = KDTree(node_array) if len(node_array) else None
+        endpoint_tree = KDTree(node_array) if KDTree is not None and len(node_array) else None
+        endpoint_buckets = (
+            self._build_spatial_buckets(nodes, extension_length)
+            if endpoint_tree is None and nodes
+            else None
+        )
 
         segment_lines = [
             LineString([segment.start.to_2d(), segment.end.to_2d()])
@@ -369,6 +465,7 @@ class GraphProcessor:
         return {
             "nodes": nodes,
             "endpoint_tree": endpoint_tree,
+            "endpoint_buckets": endpoint_buckets,
             "segment_tree": segment_tree,
             "segment_lines": segment_lines,
             "dangling_nodes": [node for node in nodes if graph.degree(node) == 1],
@@ -553,11 +650,14 @@ class GraphProcessor:
         extension_index: Dict,
     ) -> Optional[Dict]:
         endpoint_tree = extension_index["endpoint_tree"]
-        if endpoint_tree is None:
-            return None
-
         best_candidate = None
-        candidate_indices = endpoint_tree.query_ball_point([node[0], node[1]], extension_length)
+        candidate_indices = self._query_endpoint_neighbors(
+            extension_index["nodes"],
+            endpoint_tree,
+            extension_index.get("endpoint_buckets"),
+            node,
+            extension_length,
+        )
 
         for candidate_index in candidate_indices:
             other_node = extension_index["nodes"][candidate_index]
@@ -763,11 +863,8 @@ class GraphProcessor:
         # Convert to numpy array
         endpoints_array = np.array(endpoints)
 
-        # Build KD-tree
-        kdtree = KDTree(endpoints_array)
-
         # Find pairs within tolerance
-        pairs = kdtree.query_pairs(self.tolerance)
+        pairs = self._find_endpoint_pairs_within_tolerance(endpoints, endpoints_array, self.tolerance)
 
         logger.debug(f"Found {len(pairs)} endpoint pairs within tolerance {self.tolerance:.6f}")
 
@@ -829,6 +926,79 @@ class GraphProcessor:
             snapped_segments.append(snapped_seg)
 
         return snapped_segments
+
+    def _find_endpoint_pairs_within_tolerance(
+        self,
+        endpoints: List[Tuple[float, float]],
+        endpoints_array: np.ndarray,
+        tolerance: float,
+    ) -> Set[Tuple[int, int]]:
+        if KDTree is not None:
+            kdtree = KDTree(endpoints_array)
+            return set(kdtree.query_pairs(tolerance))
+
+        buckets = self._build_spatial_buckets(endpoints, tolerance)
+        pairs: Set[Tuple[int, int]] = set()
+
+        for left_index, coord in enumerate(endpoints):
+            for right_index in self._query_endpoint_neighbors(
+                endpoints,
+                tree=None,
+                buckets=buckets,
+                point=coord,
+                radius=tolerance,
+            ):
+                if right_index <= left_index:
+                    continue
+                other = endpoints[right_index]
+                if math.hypot(coord[0] - other[0], coord[1] - other[1]) > tolerance:
+                    continue
+                pairs.add((left_index, right_index))
+
+        return pairs
+
+    def _build_spatial_buckets(
+        self,
+        points: Iterable[Tuple[float, float]],
+        radius: float,
+    ) -> Dict[Tuple[int, int], List[int]]:
+        cell_size = max(radius, 1.0)
+        buckets: Dict[Tuple[int, int], List[int]] = {}
+
+        for index, point in enumerate(points):
+            cell = self._bucket_cell(point, cell_size)
+            buckets.setdefault(cell, []).append(index)
+
+        return buckets
+
+    def _query_endpoint_neighbors(
+        self,
+        points: List[Tuple[float, float]],
+        tree,
+        buckets: Optional[Dict[Tuple[int, int], List[int]]],
+        point: Tuple[float, float],
+        radius: float,
+    ) -> List[int]:
+        if tree is not None:
+            return list(tree.query_ball_point([point[0], point[1]], radius))
+        if not buckets:
+            return []
+
+        cell_size = max(radius, 1.0)
+        cell_x, cell_y = self._bucket_cell(point, cell_size)
+        candidate_indices: List[int] = []
+
+        for neighbor_cell_x in range(cell_x - 1, cell_x + 2):
+            for neighbor_cell_y in range(cell_y - 1, cell_y + 2):
+                candidate_indices.extend(buckets.get((neighbor_cell_x, neighbor_cell_y), []))
+
+        return candidate_indices
+
+    def _bucket_cell(self, point: Tuple[float, float], cell_size: float) -> Tuple[int, int]:
+        return (
+            math.floor(point[0] / cell_size),
+            math.floor(point[1] / cell_size),
+        )
 
     def _build_graph(self, segments: List[Segment]) -> nx.Graph:
         """
@@ -984,6 +1154,17 @@ class GraphProcessor:
     ) -> float:
         dot = max(-1.0, min(1.0, left[0] * right[0] + left[1] * right[1]))
         return math.degrees(math.acos(dot))
+
+    def _edge_angle(
+        self,
+        start: Tuple[float, float],
+        end: Tuple[float, float],
+    ) -> Optional[float]:
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        if abs(dx) <= 1e-9 and abs(dy) <= 1e-9:
+            return None
+        return math.degrees(math.atan2(dy, dx))
 
     def _angle_delta(self, left_deg: float, right_deg: float) -> float:
         delta = abs((left_deg - right_deg) % 180.0)

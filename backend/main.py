@@ -56,6 +56,7 @@ async def root():
         "status": "running",
         "endpoints": {
             "docs": "/docs",
+            "preprocess_dxf": "/api/preprocess-dxf",
             "detect_boundary": "/api/detect-boundary"
         }
     }

@@ -17,6 +17,24 @@ class BoundaryData(BaseModel):
     )
 
 
+class PreprocessedData(BaseModel):
+    """Preprocessed drawing preview data."""
+    segments: List[List[List[float]]] = Field(
+        default_factory=list,
+        description="Preprocessed linework segments as [[[x1, y1], [x2, y2]], ...]"
+    )
+
+
+class PreprocessMetadata(BaseModel):
+    """Metadata returned by preprocess-only runs."""
+    units: Optional[str] = Field(None, description="Detected DXF drawing units")
+    insunits_code: Optional[int] = Field(None, description="Raw INSUNITS code from the DXF header")
+    unit_scale_to_mm: Optional[float] = Field(None, description="Scale factor applied to normalize geometry to millimeters")
+    processing_time_ms: int = Field(..., ge=0, description="Processing time in milliseconds")
+    entity_count: Optional[int] = Field(None, ge=0, description="Total DXF entities processed")
+    processing_details: Optional[Dict[str, Any]] = Field(None, description="Additional structured preprocessing diagnostics")
+
+
 class Metadata(BaseModel):
     """Processing metadata and statistics."""
     area: float = Field(..., description="Detected boundary area in square units")
@@ -47,7 +65,16 @@ class BoundaryResponse(BaseModel):
     """API response for boundary detection."""
     success: bool = Field(..., description="Whether detection was successful")
     boundary: Optional[BoundaryData] = Field(None, description="Detected boundary data")
+    preprocessed: Optional[PreprocessedData] = Field(None, description="Preprocessed drawing preview data")
     metadata: Optional[Metadata] = Field(None, description="Processing metadata")
+    error: Optional[str] = Field(None, description="Error message if failed")
+
+
+class PreprocessResponse(BaseModel):
+    """API response for preprocess-only preview."""
+    success: bool = Field(..., description="Whether preprocessing was successful")
+    preprocessed: Optional[PreprocessedData] = Field(None, description="Preprocessed drawing preview data")
+    metadata: Optional[PreprocessMetadata] = Field(None, description="Preprocessing metadata")
     error: Optional[str] = Field(None, description="Error message if failed")
 
 

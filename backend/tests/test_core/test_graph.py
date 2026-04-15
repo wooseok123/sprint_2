@@ -2,9 +2,11 @@ import sys
 from pathlib import Path
 
 import networkx as nx
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+import core.graph as graph_module
 from core.graph import GraphProcessor
 from core.parser import Point, Segment
 
@@ -77,3 +79,80 @@ def test_graph_processor_batches_multiple_gap_closures_in_single_run():
     assert len(processor.extension_metadata["applied_extensions"]) == 2
     assert nx.number_connected_components(graph) == 2
     assert sum(1 for degree in dict(graph.degree()).values() if degree == 1) == 0
+
+
+def test_graph_processor_returns_pruned_active_segments_without_short_spur():
+    segments = [
+        _segment((0, 0), (1000, 0)),
+        _segment((1000, 0), (1000, 600)),
+        _segment((1000, 600), (0, 600)),
+        _segment((0, 600), (0, 0)),
+        _segment((500, 600), (500, 660)),
+    ]
+    processor = GraphProcessor(
+        bbox={"minX": 0, "minY": 0, "maxX": 1000, "maxY": 660},
+    )
+
+    _, snapped_segments = processor.build_graph_and_snap(segments)
+    metrics = processor.prune_dangling_edges()
+    active_segments = processor.get_active_segments(snapped_segments)
+
+    assert metrics.pruned_edges == 1
+    assert len(active_segments) == 4
+    assert all(
+        {
+            active.start.to_2d(),
+            active.end.to_2d(),
+        } != {(500, 600), (500, 660)}
+        for active in active_segments
+    )
+
+
+def test_graph_processor_prunes_t_junction_terminal_branch_beyond_short_spur_limit():
+    segments = [
+        _segment((0, 0), (1000, 0)),
+        _segment((1000, 0), (1000, 600)),
+        _segment((1000, 600), (500, 600)),
+        _segment((500, 600), (0, 600)),
+        _segment((0, 600), (0, 0)),
+        _segment((500, 600), (500, 840)),
+    ]
+    processor = GraphProcessor(
+        bbox={"minX": 0, "minY": 0, "maxX": 1000, "maxY": 840},
+    )
+
+    _, snapped_segments = processor.build_graph_and_snap(segments)
+    metrics = processor.prune_dangling_edges()
+    active_segments = processor.get_active_segments(snapped_segments)
+
+    assert metrics.pruned_edges == 1
+    assert len(active_segments) == 5
+    assert all(
+        {
+            active.start.to_2d(),
+            active.end.to_2d(),
+        } != {(500, 600), (500, 840)}
+        for active in active_segments
+    )
+
+
+def test_graph_processor_snapping_works_without_scipy(monkeypatch):
+    monkeypatch.setattr(graph_module, "KDTree", None)
+
+    segments = [
+        _segment((0, 0), (1000, 0)),
+        _segment((1000.4, 0), (1000.4, 600)),
+        _segment((1000, 600), (0, 600)),
+        _segment((0, 600), (0, 0)),
+    ]
+    processor = GraphProcessor(
+        bbox={"minX": 0, "minY": 0, "maxX": 1000.4, "maxY": 600},
+        adaptive_params={"max_tolerance_mm": 1.0},
+    )
+
+    graph, snapped_segments = processor.build_graph_and_snap(segments)
+
+    assert graph.number_of_nodes() == 4
+    assert nx.number_connected_components(graph) == 1
+    assert snapped_segments[0].end.to_2d() == pytest.approx((1000.2, 0.0), abs=1e-6)
+    assert snapped_segments[1].start.to_2d() == pytest.approx((1000.2, 0.0), abs=1e-6)

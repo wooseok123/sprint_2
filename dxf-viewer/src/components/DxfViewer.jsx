@@ -3,12 +3,19 @@ import { DxfViewer } from 'dxf-viewer'
 import * as THREE from 'three'
 import DxfViewerWorker from './DxfViewerWorker.js?worker'
 import BoundaryOverlay from './BoundaryOverlay'
+import SegmentOverlay from './SegmentOverlay'
 import BoundaryControls from './BoundaryControls'
-import { detectBoundary } from '../services/boundaryApi'
+import { detectBoundary, preprocessDrawing } from '../services/boundaryApi'
 import './DxfViewer.css'
 
 const VIEW_PADDING = 0.08
 const DEFAULT_UNIT_SCALE_TO_MM = 1
+const VIEW_MODES = {
+  ORIGINAL: 'original',
+  PREPROCESSED: 'preprocessed',
+  BOUNDARY: 'boundary',
+  OVERLAY: 'overlay'
+}
 
 function transformBoundaryToViewerUnits(boundary, metadata) {
   if (!boundary) {
@@ -66,17 +73,66 @@ function transformExtensionHighlightsToViewerUnits(metadata) {
     .filter(Boolean)
 }
 
+function transformPreprocessedToViewerUnits(preprocessed, metadata) {
+  if (!preprocessed?.segments) {
+    return preprocessed
+  }
+
+  const scale = metadata?.unit_scale_to_mm ?? DEFAULT_UNIT_SCALE_TO_MM
+  if (!Number.isFinite(scale) || scale === 0 || scale === 1) {
+    return preprocessed
+  }
+
+  return {
+    ...preprocessed,
+    segments: preprocessed.segments.map(([start, end]) => [
+      [start[0] / scale, start[1] / scale],
+      [end[0] / scale, end[1] / scale]
+    ])
+  }
+}
+
+function bboxToSegments(bbox, scale = DEFAULT_UNIT_SCALE_TO_MM) {
+  if (!bbox) {
+    return []
+  }
+
+  const normalize = (value) => (!Number.isFinite(scale) || scale === 0 || scale === 1 ? value : value / scale)
+  const minX = normalize(bbox.minX)
+  const minY = normalize(bbox.minY)
+  const maxX = normalize(bbox.maxX)
+  const maxY = normalize(bbox.maxY)
+
+  return [
+    [[minX, minY], [maxX, minY]],
+    [[maxX, minY], [maxX, maxY]],
+    [[maxX, maxY], [minX, maxY]],
+    [[minX, maxY], [minX, minY]]
+  ]
+}
+
+function transformPreprocessingDebugToViewerUnits(metadata) {
+  const scale = metadata?.unit_scale_to_mm ?? DEFAULT_UNIT_SCALE_TO_MM
+  const preprocessing = metadata?.processing_details?.preprocessing
+
+  return {
+    workAreaSegments: bboxToSegments(preprocessing?.work_area_bbox, scale),
+    titleBlockSegments: bboxToSegments(preprocessing?.title_block_bbox, scale),
+    titleBlockCandidateSegments: bboxToSegments(preprocessing?.title_block_candidate_bbox, scale)
+  }
+}
+
 function DxfViewerComponent({ dxfFile }) {
   const containerRef = useRef(null)
   const viewerRef = useRef(null)
   const [bounds, setBounds] = useState(null)
 
   // Boundary detection state
-  const [boundaryData, setBoundaryData] = useState(null)
+  const [processingData, setProcessingData] = useState(null)
+  const [isPreprocessing, setIsPreprocessing] = useState(false)
   const [isDetecting, setIsDetecting] = useState(false)
   const [error, setError] = useState(null)
-  const [drawingVisible, setDrawingVisible] = useState(true)
-  const [overlayVisible, setOverlayVisible] = useState(true)
+  const [viewMode, setViewMode] = useState(VIEW_MODES.ORIGINAL)
 
   const fitViewerToBounds = useCallback((viewer, nextBounds) => {
     if (!viewer || !nextBounds) {
@@ -118,7 +174,13 @@ function DxfViewerComponent({ dxfFile }) {
     const isOverlayObject = (object) => {
       let current = object
       while (current) {
-        if (current.name === 'boundary-overlay') {
+        if (
+          current.name === 'boundary-overlay'
+          || current.name === 'preprocessed-overlay'
+          || current.name === 'work-area-overlay'
+          || current.name === 'title-block-overlay'
+          || current.name === 'title-block-candidate-overlay'
+        ) {
           return true
         }
         current = current.parent
@@ -215,24 +277,51 @@ function DxfViewerComponent({ dxfFile }) {
 
   // Reset boundary data when file changes
   useEffect(() => {
-    setBoundaryData(null)
+    setProcessingData(null)
     setError(null)
-    setDrawingVisible(true)
-    setOverlayVisible(true)
+    setViewMode(VIEW_MODES.ORIGINAL)
   }, [dxfFile])
 
   useEffect(() => {
     if (!viewerRef.current) {
       return
     }
-    applyDrawingVisibility(viewerRef.current, drawingVisible)
-  }, [applyDrawingVisibility, drawingVisible])
+    applyDrawingVisibility(
+      viewerRef.current,
+      viewMode !== VIEW_MODES.PREPROCESSED && viewMode !== VIEW_MODES.OVERLAY
+    )
+  }, [applyDrawingVisibility, viewMode])
 
   const handleResetView = () => {
     if (viewerRef.current && bounds) {
       fitViewerToBounds(viewerRef.current, bounds)
     }
   }
+
+  const handlePreprocess = useCallback(async () => {
+    if (!dxfFile) return
+
+    setIsPreprocessing(true)
+    setError(null)
+
+    try {
+      const result = await preprocessDrawing(dxfFile)
+      setProcessingData({
+        boundary: null,
+        preprocessed: transformPreprocessedToViewerUnits(result.preprocessed, result.metadata),
+        metadata: result.metadata,
+        extensionHighlights: transformExtensionHighlightsToViewerUnits(result.metadata),
+        preprocessingDebug: transformPreprocessingDebugToViewerUnits(result.metadata)
+      })
+      setViewMode(VIEW_MODES.PREPROCESSED)
+      console.log('Preprocessing complete:', result)
+    } catch (err) {
+      console.error('Preprocessing failed:', err)
+      setError(err.message || 'Failed to preprocess drawing')
+    } finally {
+      setIsPreprocessing(false)
+    }
+  }, [dxfFile])
 
   const handleDetectBoundary = useCallback(async () => {
     if (!dxfFile) return
@@ -242,11 +331,14 @@ function DxfViewerComponent({ dxfFile }) {
 
     try {
       const result = await detectBoundary(dxfFile)
-      setBoundaryData({
+      setProcessingData({
         ...result,
         boundary: transformBoundaryToViewerUnits(result.boundary, result.metadata),
-        extensionHighlights: transformExtensionHighlightsToViewerUnits(result.metadata)
+        preprocessed: transformPreprocessedToViewerUnits(result.preprocessed, result.metadata),
+        extensionHighlights: transformExtensionHighlightsToViewerUnits(result.metadata),
+        preprocessingDebug: transformPreprocessingDebugToViewerUnits(result.metadata)
       })
+      setViewMode(VIEW_MODES.BOUNDARY)
       console.log('Boundary detected:', result)
     } catch (err) {
       console.error('Boundary detection failed:', err)
@@ -256,19 +348,14 @@ function DxfViewerComponent({ dxfFile }) {
     }
   }, [dxfFile])
 
-  const handleToggleOverlay = useCallback(() => {
-    setOverlayVisible(prev => !prev)
-  }, [])
-
-  const handleToggleDrawing = useCallback(() => {
-    setDrawingVisible(prev => !prev)
+  const handleChangeViewMode = useCallback((nextMode) => {
+    setViewMode(nextMode)
   }, [])
 
   const handleClearBoundary = useCallback(() => {
-    setBoundaryData(null)
+    setProcessingData(null)
     setError(null)
-    setDrawingVisible(true)
-    setOverlayVisible(true)
+    setViewMode(VIEW_MODES.ORIGINAL)
   }, [])
 
   return (
@@ -276,27 +363,28 @@ function DxfViewerComponent({ dxfFile }) {
       {/* Boundary Controls */}
       <BoundaryControls
         dxfFile={dxfFile}
+        onPreprocess={handlePreprocess}
         onDetect={handleDetectBoundary}
+        isPreprocessing={isPreprocessing}
         isDetecting={isDetecting}
-        metadata={boundaryData ? {
-          area: boundaryData.metadata?.area,
-          area_unit: boundaryData.metadata?.area_unit,
-          perimeter: boundaryData.metadata?.perimeter,
-          perimeter_unit: boundaryData.metadata?.perimeter_unit,
-          confidence: boundaryData.metadata?.confidence,
-          exterior_vertex_count: boundaryData.metadata?.exterior_vertex_count,
-          interior_hole_count: boundaryData.boundary?.interiors?.length || 0,
-          processing_time_ms: boundaryData.metadata?.processing_time_ms,
-          convex_hull_ratio: boundaryData.metadata?.convex_hull_ratio,
-          hatch_iou: boundaryData.metadata?.hatch_iou,
-          processing_details: boundaryData.metadata?.processing_details
+        metadata={processingData ? {
+          area: processingData.metadata?.area,
+          area_unit: processingData.metadata?.area_unit,
+          perimeter: processingData.metadata?.perimeter,
+          perimeter_unit: processingData.metadata?.perimeter_unit,
+          confidence: processingData.metadata?.confidence,
+          exterior_vertex_count: processingData.metadata?.exterior_vertex_count,
+          interior_hole_count: processingData.boundary?.interiors?.length || 0,
+          processing_time_ms: processingData.metadata?.processing_time_ms,
+          convex_hull_ratio: processingData.metadata?.convex_hull_ratio,
+          hatch_iou: processingData.metadata?.hatch_iou,
+          processing_details: processingData.metadata?.processing_details
         } : null}
         error={error}
-        hasBoundary={!!boundaryData}
-        drawingVisible={drawingVisible}
-        overlayVisible={overlayVisible}
-        onToggleDrawing={handleToggleDrawing}
-        onToggleOverlay={handleToggleOverlay}
+        hasBoundary={Boolean(processingData?.boundary?.exterior?.length)}
+        hasPreprocessed={Boolean(processingData?.preprocessed?.segments?.length)}
+        viewMode={viewMode}
+        onChangeViewMode={handleChangeViewMode}
         onClear={handleClearBoundary}
       />
 
@@ -318,13 +406,57 @@ function DxfViewerComponent({ dxfFile }) {
         <div ref={containerRef} className="viewer-container" />
       </div>
 
+      {viewerRef.current && processingData?.preprocessed?.segments?.length > 0 && (
+        <SegmentOverlay
+          viewer={viewerRef.current}
+          segments={processingData.preprocessed.segments}
+          visible={viewMode === VIEW_MODES.PREPROCESSED}
+          name="preprocessed-overlay"
+          color="#147d64"
+          opacity={0.96}
+        />
+      )}
+
+      {viewerRef.current && processingData?.preprocessingDebug?.workAreaSegments?.length > 0 && (
+        <SegmentOverlay
+          viewer={viewerRef.current}
+          segments={processingData.preprocessingDebug.workAreaSegments}
+          visible={viewMode === VIEW_MODES.PREPROCESSED}
+          name="work-area-overlay"
+          color="#2563eb"
+          opacity={0.9}
+        />
+      )}
+
+      {viewerRef.current && processingData?.preprocessingDebug?.titleBlockCandidateSegments?.length > 0 && (
+        <SegmentOverlay
+          viewer={viewerRef.current}
+          segments={processingData.preprocessingDebug.titleBlockCandidateSegments}
+          visible={viewMode === VIEW_MODES.PREPROCESSED}
+          name="title-block-candidate-overlay"
+          color="#f59e0b"
+          opacity={0.88}
+        />
+      )}
+
+      {viewerRef.current && processingData?.preprocessingDebug?.titleBlockSegments?.length > 0 && (
+        <SegmentOverlay
+          viewer={viewerRef.current}
+          segments={processingData.preprocessingDebug.titleBlockSegments}
+          visible={viewMode === VIEW_MODES.PREPROCESSED}
+          name="title-block-overlay"
+          color="#dc2626"
+          opacity={0.92}
+        />
+      )}
+
       {/* Boundary overlay rendered in the same Three.js scene as the DXF */}
-      {viewerRef.current && boundaryData && (
+      {viewerRef.current && processingData?.boundary && (
         <BoundaryOverlay
           viewer={viewerRef.current}
-          boundary={boundaryData.boundary}
-          extensionHighlights={boundaryData.extensionHighlights}
-          visible={overlayVisible}
+          boundary={processingData.boundary}
+          extensionHighlights={processingData.extensionHighlights}
+          visible={viewMode === VIEW_MODES.BOUNDARY || viewMode === VIEW_MODES.OVERLAY}
           showInteriors={false}
           colors={{ exterior: '#0B3EA8', interior: '#0B3EA8', extension: '#FF7A00' }}
         />
