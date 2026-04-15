@@ -16,6 +16,7 @@ import ezdxf
 import numpy as np
 from ezdxf.entities import DXFEntity
 from ezdxf.math import Matrix44, Vec3
+from shapely.geometry import GeometryCollection, LineString, MultiLineString, Point as ShapelyPoint, Polygon
 
 try:
     from scipy.spatial import cKDTree
@@ -75,6 +76,7 @@ class FlattenedEntity:
     effective_layer: Optional[str]
     effective_linetype: Optional[str]
     block_path: Tuple[str, ...] = ()
+    clip_boundaries: Tuple[Polygon, ...] = ()
 
 
 class DXFParser:
@@ -203,6 +205,7 @@ class DXFParser:
                         parent_layer=None,
                         parent_linetype=None,
                         block_path=(),
+                        clip_boundaries=(),
                     )
                 )
             except Exception as e:
@@ -253,6 +256,7 @@ class DXFParser:
         parent_layer: Optional[str],
         parent_linetype: Optional[str],
         block_path: Tuple[str, ...],
+        clip_boundaries: Tuple[Polygon, ...],
     ) -> List[FlattenedEntity]:
         """Explode INSERT trees into leaf entities while preserving inheritance context."""
         if not self._is_entity_renderable(entity):
@@ -279,6 +283,11 @@ class DXFParser:
                 logger.warning(f"Block definition not found: {block_name}")
                 return []
 
+            next_clip_boundaries = clip_boundaries
+            insert_clip = self._extract_insert_clip_boundary(entity, combined_transform)
+            if insert_clip is not None:
+                next_clip_boundaries = clip_boundaries + (insert_clip,)
+
             new_visited = visited.copy()
             new_visited.add(block_name)
             flattened: List[FlattenedEntity] = []
@@ -292,9 +301,13 @@ class DXFParser:
                         parent_layer=effective_layer,
                         parent_linetype=effective_linetype,
                         block_path=next_block_path,
+                        clip_boundaries=next_clip_boundaries,
                     )
                 )
             return flattened
+
+        if clip_boundaries and not self._entity_intersects_clip_boundaries(entity, parent_transform, clip_boundaries):
+            return []
 
         return [
             FlattenedEntity(
@@ -303,6 +316,7 @@ class DXFParser:
                 effective_layer=effective_layer,
                 effective_linetype=effective_linetype,
                 block_path=block_path,
+                clip_boundaries=clip_boundaries,
             )
         ]
 
@@ -423,6 +437,8 @@ class DXFParser:
     def _process_flattened_entity(self, flattened: FlattenedEntity) -> List[Segment]:
         """Convert a flattened leaf entity into normalized segments."""
         segments = self._process_entity(flattened.entity, flattened.transform)
+        if flattened.clip_boundaries:
+            segments = self._clip_segments_to_boundaries(segments, flattened.clip_boundaries)
         for segment in segments:
             segment.meta["layer"] = flattened.effective_layer or segment.meta.get("layer")
             if flattened.effective_linetype:
@@ -430,6 +446,211 @@ class DXFParser:
             if flattened.block_path:
                 segment.meta["block_path"] = list(flattened.block_path)
         return segments
+
+    def _extract_insert_clip_boundary(
+        self,
+        insert_entity: DXFEntity,
+        world_transform: Optional[Matrix44],
+    ) -> Optional[Polygon]:
+        """Resolve an INSERT XCLIP/SPATIAL_FILTER into a world-space polygon."""
+        if not getattr(insert_entity, "has_extension_dict", False):
+            return None
+
+        try:
+            extension_dict = insert_entity.get_extension_dict()
+        except Exception:
+            return None
+
+        if "ACAD_FILTER" not in extension_dict:
+            return None
+
+        try:
+            filter_dict = extension_dict["ACAD_FILTER"]
+        except Exception:
+            return None
+
+        spatial_filter = None
+        try:
+            if hasattr(filter_dict, "keys"):
+                for key in filter_dict.keys():
+                    candidate = filter_dict[key]
+                    if candidate.dxftype() == "SPATIAL_FILTER":
+                        spatial_filter = candidate
+                        break
+        except Exception:
+            return None
+
+        if spatial_filter is None or not bool(getattr(spatial_filter.dxf, "is_clipping_enabled", 0)):
+            return None
+
+        try:
+            local_vertices = [
+                spatial_filter.transform_matrix.transform(
+                    spatial_filter.inverse_insert_matrix.transform((vertex.x, vertex.y, 0.0))
+                )
+                for vertex in spatial_filter.boundary_vertices
+            ]
+        except Exception as exc:
+            logger.debug("Failed to resolve SPATIAL_FILTER for INSERT %s: %s", insert_entity.dxftype(), exc)
+            return None
+
+        if len(local_vertices) < 3:
+            return None
+
+        world_vertices = [
+            self._apply_transform((vertex.x, vertex.y), world_transform).to_2d()
+            for vertex in local_vertices
+        ]
+        polygon = Polygon(world_vertices)
+        if polygon.is_empty:
+            return None
+        if not polygon.is_valid:
+            polygon = polygon.buffer(0)
+        if polygon.is_empty or polygon.area <= 0:
+            return None
+        return polygon
+
+    def _entity_intersects_clip_boundaries(
+        self,
+        entity: DXFEntity,
+        transform: Optional[Matrix44],
+        clip_boundaries: Tuple[Polygon, ...],
+    ) -> bool:
+        geometry = self._entity_clip_geometry(entity, transform)
+        if geometry is None:
+            return True
+
+        clipped = geometry
+        for clip_boundary in clip_boundaries:
+            try:
+                clipped = clipped.intersection(clip_boundary)
+            except Exception:
+                return True
+            if clipped.is_empty:
+                return False
+        return not clipped.is_empty
+
+    def _entity_clip_geometry(
+        self,
+        entity: DXFEntity,
+        transform: Optional[Matrix44],
+    ):
+        dxftype = entity.dxftype()
+        try:
+            if dxftype == "LINE":
+                start = self._apply_transform((entity.dxf.start.x, entity.dxf.start.y), transform).to_2d()
+                end = self._apply_transform((entity.dxf.end.x, entity.dxf.end.y), transform).to_2d()
+                return LineString([start, end])
+            if dxftype in {"LWPOLYLINE", "POLYLINE"}:
+                points = [point.to_2d() for point in self._get_polyline_points(entity, transform=transform)]
+                if len(points) < 2:
+                    return ShapelyPoint(points[0]) if points else None
+                if self._polyline_is_closed(entity) and points[0] != points[-1]:
+                    points.append(points[0])
+                return LineString(points)
+            if dxftype == "SPLINE":
+                points = [
+                    self._apply_transform((point[0], point[1]), transform).to_2d()
+                    for point in entity.discretize(segment_count=24).vertices_in_wcs()
+                ]
+                if len(points) < 2:
+                    return ShapelyPoint(points[0]) if points else None
+                return LineString(points)
+            if dxftype == "ARC":
+                points = []
+                start_angle = float(entity.dxf.start_angle)
+                end_angle = float(entity.dxf.end_angle)
+                if end_angle <= start_angle:
+                    end_angle += 360.0
+                steps = max(8, int((end_angle - start_angle) / 15.0))
+                for index in range(steps + 1):
+                    angle = start_angle + (end_angle - start_angle) * index / steps
+                    points.append(self._apply_transform(self._arc_point(entity, angle), transform).to_2d())
+                return LineString(points)
+            if dxftype in {"TEXT", "MTEXT", "POINT"}:
+                insert = getattr(entity.dxf, "insert", None) or getattr(entity.dxf, "location", None)
+                if insert is None:
+                    return None
+                point = self._apply_transform((insert.x, insert.y), transform).to_2d()
+                return ShapelyPoint(point)
+        except Exception:
+            logger.debug("Failed to build clip geometry for %s", dxftype)
+
+        bbox = self._entity_bbox_dict(
+            FlattenedEntity(
+                entity=entity,
+                transform=transform,
+                effective_layer=None,
+                effective_linetype=None,
+            )
+        )
+        if bbox is None:
+            return None
+        return Polygon([
+            (bbox["minX"], bbox["minY"]),
+            (bbox["maxX"], bbox["minY"]),
+            (bbox["maxX"], bbox["maxY"]),
+            (bbox["minX"], bbox["maxY"]),
+        ])
+
+    def _clip_segments_to_boundaries(
+        self,
+        segments: List[Segment],
+        clip_boundaries: Tuple[Polygon, ...],
+    ) -> List[Segment]:
+        clipped_segments: List[Segment] = []
+        for segment in segments:
+            geometry = LineString([segment.start.to_2d(), segment.end.to_2d()])
+            for clip_boundary in clip_boundaries:
+                geometry = geometry.intersection(clip_boundary)
+                if geometry.is_empty:
+                    break
+
+            if geometry.is_empty:
+                continue
+
+            clipped_segments.extend(self._segment_parts_from_geometry(geometry, segment.meta))
+        return clipped_segments
+
+    def _segment_parts_from_geometry(
+        self,
+        geometry,
+        meta: Dict[str, Any],
+    ) -> List[Segment]:
+        if geometry.is_empty:
+            return []
+        if isinstance(geometry, LineString):
+            return self._segments_from_linestring(geometry, meta)
+        if isinstance(geometry, MultiLineString):
+            parts: List[Segment] = []
+            for line in geometry.geoms:
+                parts.extend(self._segments_from_linestring(line, meta))
+            return parts
+        if isinstance(geometry, GeometryCollection):
+            parts: List[Segment] = []
+            for item in geometry.geoms:
+                parts.extend(self._segment_parts_from_geometry(item, meta))
+            return parts
+        return []
+
+    def _segments_from_linestring(
+        self,
+        linestring: LineString,
+        meta: Dict[str, Any],
+    ) -> List[Segment]:
+        coords = list(linestring.coords)
+        parts: List[Segment] = []
+        for start, end in zip(coords, coords[1:]):
+            if start == end:
+                continue
+            parts.append(
+                Segment(
+                    start=Point(float(start[0]), float(start[1])),
+                    end=Point(float(end[0]), float(end[1])),
+                    meta=dict(meta),
+                )
+            )
+        return parts
 
     def _resolve_effective_layer(
         self,
