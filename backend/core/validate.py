@@ -91,6 +91,7 @@ class BoundaryValidator:
         # Calculate metadata
         metadata = {
             'area': corrected.area,
+            'perimeter': corrected.exterior.length,
             'vertex_count': len(exterior_coords),
             'interior_count': len(interiors_coords),
             'confidence': iou_confidence,

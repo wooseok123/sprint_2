@@ -136,6 +136,22 @@ def test_outline_v2_preserves_courtyard_hole():
     assert Polygon(polygon.interiors[0]).area == pytest.approx(Polygon(courtyard_inner).area, rel=0.15)
 
 
+def test_outline_v2_fills_oversized_shell_hole():
+    shell = Polygon(
+        [(0, 0), (2000, 0), (2000, 1000), (0, 1000)],
+        holes=[
+            [(100, 100), (900, 100), (900, 900), (100, 900)],
+            [(1100, 100), (1800, 100), (1800, 900), (1100, 900)],
+        ],
+    )
+
+    polygon, metadata = OutlineExtractorV2()._assemble_footprint(shell)
+
+    assert polygon is not None
+    assert len(polygon.interiors) == 0
+    assert metadata["footprint_holes"] == 0
+
+
 def test_outline_v2_handles_l_shaped_double_wall():
     outer = [(0, 0), (420, 0), (420, 170), (170, 170), (170, 420), (0, 420)]
     segments = _build_noded_double_wall_l_shape()
@@ -156,3 +172,116 @@ def test_outline_v2_falls_back_to_parallel_pairs_without_connectors():
     assert polygon is not None
     assert polygon.area > 500000
     assert metadata["estimate_method"] in {"parallel_pairs", "bbox_fallback"}
+
+
+def test_outline_v2_opening_removes_small_protrusion():
+    polygon = Polygon([
+        (0, 0),
+        (1000, 0),
+        (1000, 250),
+        (1040, 250),
+        (1040, 310),
+        (1000, 310),
+        (1000, 600),
+        (0, 600),
+    ])
+
+    extractor = OutlineExtractorV2()
+    cleaned, metadata = extractor._apply_opening_with_guard(polygon, wall_thickness=80.0)
+
+    assert cleaned.bounds[2] == pytest.approx(1000.0, abs=1.0)
+    assert metadata["opening_applied"] is True
+    assert metadata["opening_rollback_reasons"] == []
+
+
+def test_outline_v2_opening_rolls_back_when_result_collapses():
+    polygon = Polygon([(0, 0), (100, 0), (100, 100), (0, 100)])
+
+    extractor = OutlineExtractorV2(opening_radius_ratio=2.0)
+    cleaned, metadata = extractor._apply_opening_with_guard(polygon, wall_thickness=120.0)
+
+    assert cleaned.equals(polygon)
+    assert metadata["opening_applied"] is False
+    assert "empty_result" in metadata["opening_rollback_reasons"]
+
+
+def test_outline_v2_closing_fills_small_inward_notch():
+    polygon = Polygon([
+        (0, 0),
+        (1000, 0),
+        (1000, 250),
+        (960, 250),
+        (960, 310),
+        (1000, 310),
+        (1000, 600),
+        (0, 600),
+    ])
+
+    extractor = OutlineExtractorV2()
+    cleaned, metadata = extractor._apply_closing_with_guard(polygon, wall_thickness=80.0)
+
+    assert cleaned.bounds[2] == pytest.approx(1000.0, abs=2.0)
+    assert cleaned.area > polygon.area
+    assert metadata["closing_applied"] is True
+    assert metadata["closing_rollback_reasons"] == []
+
+
+def test_outline_v2_bridge_removes_large_door_sized_protrusion():
+    polygon = Polygon([
+        (0, 0),
+        (1000, 0),
+        (1000, 200),
+        (1040, 230),
+        (1070, 270),
+        (1080, 320),
+        (1070, 370),
+        (1040, 410),
+        (1000, 440),
+        (1000, 600),
+        (0, 600),
+    ])
+
+    extractor = OutlineExtractorV2()
+    cleaned, metadata = extractor._apply_bridge_with_guard(polygon, wall_thickness=40.0)
+
+    assert cleaned.bounds[2] == pytest.approx(1000.0, abs=2.0)
+    assert metadata["bridge_applied_count"] == 1
+    assert metadata["bridge_rollback_reasons"] == []
+    assert metadata["bridge_last_candidate"] is not None
+    assert metadata["bridge_last_candidate_bounds"] is not None
+    assert metadata["bridge_last_candidate_metrics"]["span_ratio"] > 0
+    assert metadata["bridge_cv_fallback_recommended"] is False
+
+
+def test_outline_v2_bridge_skips_legitimate_l_shape():
+    polygon = Polygon([(0, 0), (420, 0), (420, 170), (170, 170), (170, 420), (0, 420)])
+
+    extractor = OutlineExtractorV2()
+    cleaned, metadata = extractor._apply_bridge_with_guard(polygon, wall_thickness=40.0)
+
+    assert cleaned.equals(polygon)
+    assert metadata["bridge_applied_count"] == 0
+
+
+def test_outline_v2_bridge_cv_fallback_trigger_requires_curved_failed_candidate():
+    extractor = OutlineExtractorV2()
+
+    should_recommend, reasons = extractor._should_recommend_cv_bridge_fallback({
+        "bridge_attempted": True,
+        "bridge_applied_count": 0,
+        "bridge_last_candidate_source": "curved",
+        "bridge_rollback_reasons": ["bbox_drop_exceeded", "hole_count_changed"],
+    })
+
+    assert should_recommend is True
+    assert reasons == ["bbox_drop_exceeded"]
+
+    should_recommend, reasons = extractor._should_recommend_cv_bridge_fallback({
+        "bridge_attempted": True,
+        "bridge_applied_count": 1,
+        "bridge_last_candidate_source": "curved",
+        "bridge_rollback_reasons": ["bbox_drop_exceeded"],
+    })
+
+    assert should_recommend is False
+    assert reasons == []

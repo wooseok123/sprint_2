@@ -24,6 +24,24 @@ TEST_FIXTURES_DIR = Path(__file__).parent.parent / "fixtures"
 class TestBoundaryPipelineIntegration:
     """Integration tests for the complete boundary detection pipeline."""
 
+    def test_preprocess_endpoint_returns_preview_segments(self):
+        """Preprocess endpoint should return previewable linework without boundary geometry."""
+        dxf_content = self._create_simple_rectangle_dxf()
+
+        files = {"file": ("rectangle.dxf", io.BytesIO(dxf_content), "application/dxf")}
+        response = client.post("/api/preprocess-dxf", files=files)
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert "preprocessed" in data
+        assert "metadata" in data
+        assert "segments" in data["preprocessed"]
+        assert isinstance(data["preprocessed"]["segments"], list)
+        assert "processing_details" in data["metadata"]
+        assert "preprocessing" in data["metadata"]["processing_details"]
+        assert data["metadata"]["processing_details"]["raw_parsing"]["raw_segment_extraction_skipped"] is True
+
     def test_pipeline_with_simple_rectangle(self):
         """Test pipeline with a simple rectangle DXF file."""
         # Create a minimal valid DXF file with a rectangle
@@ -42,11 +60,16 @@ class TestBoundaryPipelineIntegration:
         # If successful, validate structure
         if data.get("success"):
             assert "boundary" in data
+            assert "preprocessed" in data
             assert "metadata" in data
 
             boundary = data["boundary"]
             assert "exterior" in boundary
             assert isinstance(boundary["exterior"], list)
+
+            preprocessed = data["preprocessed"]
+            assert "segments" in preprocessed
+            assert isinstance(preprocessed["segments"], list)
 
             metadata = data["metadata"]
             assert "area" in metadata
@@ -95,6 +118,25 @@ class TestBoundaryPipelineIntegration:
         assert data["boundary"]["exterior"]
         assert data["metadata"]["area"] > 500000
 
+    def test_pipeline_uses_pruned_segments_for_outline_input(self):
+        """A short spur touching the exterior wall should be pruned before V2 outline extraction."""
+        dxf_content = self._create_double_wall_rectangle_with_short_spur_dxf()
+
+        files = {"file": ("spur_pruned.dxf", io.BytesIO(dxf_content), "application/dxf")}
+        response = client.post("/api/detect-boundary", files=files)
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+
+        exterior = data["boundary"]["exterior"]
+        max_y = max(point[1] for point in exterior)
+        assert max_y == pytest.approx(600.0, abs=10.0)
+
+        pruning_details = data["metadata"]["processing_details"]["graph_pruning"]
+        assert pruning_details["pruned_edges"] >= 1
+        assert pruning_details["outline_input_segments"] < 13
+
     def test_pipeline_error_handling_empty_dxf(self):
         """Test error handling with empty DXF file."""
         dxf_content = b""
@@ -136,13 +178,19 @@ class TestBoundaryPipelineIntegration:
         # If pipeline succeeded, validate metadata
         if data.get("success") and "metadata" in data:
             metadata = data["metadata"]
+            assert "preprocessed" in data
 
             # Check required metadata fields
             required_fields = [
                 "area",
+                "area_unit",
+                "perimeter",
+                "perimeter_unit",
+                "bbox_area_unit",
                 "confidence",
                 "processing_time_ms",
-                "exterior_vertex_count"
+                "exterior_vertex_count",
+                "processing_details",
             ]
 
             for field in required_fields:
@@ -150,9 +198,18 @@ class TestBoundaryPipelineIntegration:
 
             # Validate types
             assert isinstance(metadata["area"], (int, float))
+            assert metadata["area_unit"] == "mm²"
+            assert isinstance(metadata["perimeter"], (int, float))
+            assert metadata["perimeter_unit"] == "mm"
+            assert metadata["bbox_area_unit"] == "mm²"
             assert isinstance(metadata["confidence"], (int, float))
             assert isinstance(metadata["processing_time_ms"], (int, float))
             assert isinstance(metadata["exterior_vertex_count"], int)
+            assert isinstance(metadata["processing_details"], dict)
+            assert "endpoint_extension" in metadata["processing_details"]
+            assert "preprocessing" in metadata["processing_details"]
+            assert "outline_extraction" in metadata["processing_details"]
+            assert "cv_fallback" in metadata["processing_details"]["outline_extraction"]
         else:
             # If not successful, that's ok for this test - we're just checking structure
             assert "success" in data
@@ -270,6 +327,43 @@ class TestBoundaryPipelineIntegration:
 
         room = [(300, 180), (450, 180), (450, 330), (300, 330)]
         add_ring(room)
+
+        doc.header['$INSUNITS'] = 4
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.dxf', delete=False) as f:
+            temp_path = f.name
+            doc.write(f)
+
+        with open(temp_path, 'rb') as f:
+            content = f.read()
+
+        os.unlink(temp_path)
+        return content
+
+    def _create_double_wall_rectangle_with_short_spur_dxf(self) -> bytes:
+        """Create a double-wall rectangle plus a short exterior spur."""
+        doc = ezdxf.new('R2010', setup=True)
+        msp = doc.modelspace()
+
+        def add_segment(start, end):
+            msp.add_line(start, end)
+
+        outer = [(0, 0), (1000, 0), (1000, 600), (0, 600)]
+        inner = [(40, 40), (960, 40), (960, 560), (40, 560)]
+
+        for index, start in enumerate(outer):
+            add_segment(start, outer[(index + 1) % len(outer)])
+
+        for index, start in enumerate(inner):
+            add_segment(start, inner[(index + 1) % len(inner)])
+
+        for outer_point, inner_point in zip(
+            [(500, 0), (1000, 300), (500, 600), (0, 300)],
+            [(500, 40), (960, 300), (500, 560), (40, 300)],
+        ):
+            add_segment(outer_point, inner_point)
+
+        add_segment((500, 600), (500, 660))
 
         doc.header['$INSUNITS'] = 4
 
