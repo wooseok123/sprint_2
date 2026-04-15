@@ -249,4 +249,105 @@ def test_gemini_vision_cleanup_can_add_global_outline_scan_candidates():
     assert metadata["global_scan"]["accepted_count"] == 1
     assert metadata["candidate_count"] >= 1
     assert metadata["attempts"][0]["source"] == "global_outline_scan"
+    assert metadata["attempts"][0]["highlight_ring"] is not None
     assert cleaned.equals(polygon)
+
+
+def test_global_outline_candidate_payload_includes_chain_vs_chord_features():
+    polygon = Polygon([
+        (0, 0),
+        (600, 0),
+        (600, 220),
+        (560, 260),
+        (520, 320),
+        (560, 380),
+        (600, 420),
+        (600, 700),
+        (0, 700),
+    ])
+    segments = [
+        _line((0, 0), (600, 0)),
+        _line((600, 0), (600, 220)),
+        _line((600, 220), (560, 260)),
+        _line((560, 260), (520, 320)),
+        _line((520, 320), (560, 380)),
+        _line((560, 380), (600, 420)),
+        _line((600, 420), (600, 700)),
+        _line((600, 700), (0, 700)),
+        _line((0, 700), (0, 0)),
+    ]
+
+    judge = FakeJudge(
+        {"outline_suspect": "keep"},
+        suspicious_spans=[
+            {
+                "start_idx": 2,
+                "end_idx": 6,
+                "confidence": 0.86,
+                "feature_hint": "smooth_bulge",
+                "reason": "fan-shaped outward detour that would look cleaner if replaced by a straight chord",
+            }
+        ],
+    )
+
+    cleaned, metadata = maybe_apply_gemini_vision_cleanup(
+        polygon=polygon,
+        reference_segments=segments,
+        wall_thickness=40.0,
+        judge=judge,
+    )
+
+    chain_features = metadata["attempts"][0]["feature_payload"]["chain_vs_chord"]
+    assert chain_features["span_vertex_count"] >= 3
+    assert chain_features["detour_to_chord_ratio"] > 1.0
+    assert chain_features["max_offset_from_chord_mm"] > 0.0
+    assert chain_features["dominant_side_ratio"] >= 0.5
+    assert cleaned.equals(polygon)
+
+
+def test_global_outline_remove_uses_span_mask_polygon():
+    polygon = Polygon([
+        (0, 0),
+        (600, 0),
+        (600, 220),
+        (930, 220),
+        (930, 360),
+        (600, 360),
+        (600, 700),
+        (0, 700),
+    ])
+    segments = [
+        _line((0, 0), (600, 0)),
+        _line((600, 0), (600, 220)),
+        _line((600, 220), (930, 220)),
+        _line((930, 220), (930, 360)),
+        _line((930, 360), (600, 360)),
+        _line((600, 360), (600, 700)),
+        _line((600, 700), (0, 700)),
+        _line((0, 700), (0, 0)),
+    ]
+
+    judge = FakeJudge(
+        {"outline_suspect": "remove"},
+        suspicious_spans=[
+            {
+                "start_idx": 2,
+                "end_idx": 5,
+                "confidence": 0.95,
+                "feature_hint": "triangle_flap",
+                "reason": "outward flap that should be replaced by a straight chord",
+            }
+        ],
+    )
+
+    cleaned, metadata = maybe_apply_gemini_vision_cleanup(
+        polygon=polygon,
+        reference_segments=segments,
+        wall_thickness=40.0,
+        judge=judge,
+    )
+
+    assert metadata["applied"] is True
+    assert metadata["attempts"][0]["cleanup"]["selected_method"] == "mask_difference"
+    assert metadata["attempts"][0]["highlight_ring"] is not None
+    assert cleaned.area < polygon.area

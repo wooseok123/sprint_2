@@ -10,11 +10,9 @@ import './DxfViewer.css'
 
 const VIEW_PADDING = 0.08
 const DEFAULT_UNIT_SCALE_TO_MM = 1
-const VIEW_MODES = {
+const BASE_VIEW_MODES = {
   ORIGINAL: 'original',
-  PREPROCESSED: 'preprocessed',
-  BOUNDARY: 'boundary',
-  OVERLAY: 'overlay'
+  PREPROCESSED: 'preprocessed'
 }
 
 function transformBoundaryToViewerUnits(boundary, metadata) {
@@ -33,44 +31,6 @@ function transformBoundaryToViewerUnits(boundary, metadata) {
     exterior: rescaleRing(boundary.exterior),
     interiors: (boundary.interiors ?? []).map(rescaleRing)
   }
-}
-
-function transformExtensionHighlightsToViewerUnits(metadata) {
-  const extensions = metadata?.processing_details?.endpoint_extension?.applied_extensions
-
-  if (!Array.isArray(extensions) || extensions.length === 0) {
-    return []
-  }
-
-  const scale = metadata?.unit_scale_to_mm ?? DEFAULT_UNIT_SCALE_TO_MM
-  const normalizePoint = (point) => {
-    if (!Array.isArray(point) || point.length < 2) {
-      return null
-    }
-
-    if (!Number.isFinite(scale) || scale === 0 || scale === 1) {
-      return [point[0], point[1]]
-    }
-
-    return [point[0] / scale, point[1] / scale]
-  }
-
-  return extensions
-    .map((item) => {
-      const fromPoint = normalizePoint(item.from_point)
-      const toPoint = normalizePoint(item.to_point)
-
-      if (!fromPoint || !toPoint) {
-        return null
-      }
-
-      return {
-        ...item,
-        fromPoint,
-        toPoint
-      }
-    })
-    .filter(Boolean)
 }
 
 function transformPreprocessedToViewerUnits(preprocessed, metadata) {
@@ -92,34 +52,96 @@ function transformPreprocessedToViewerUnits(preprocessed, metadata) {
   }
 }
 
-function bboxToSegments(bbox, scale = DEFAULT_UNIT_SCALE_TO_MM) {
-  if (!bbox) {
+function transformVisionCleanupHighlightsToViewerUnits(metadata) {
+  const attempts = metadata?.processing_details?.outline_extraction?.vision_cleanup?.attempts
+
+  if (!Array.isArray(attempts) || attempts.length === 0) {
     return []
   }
 
+  const scale = metadata?.unit_scale_to_mm ?? DEFAULT_UNIT_SCALE_TO_MM
   const normalize = (value) => (!Number.isFinite(scale) || scale === 0 || scale === 1 ? value : value / scale)
-  const minX = normalize(bbox.minX)
-  const minY = normalize(bbox.minY)
-  const maxX = normalize(bbox.maxX)
-  const maxY = normalize(bbox.maxY)
 
-  return [
-    [[minX, minY], [maxX, minY]],
-    [[maxX, minY], [maxX, maxY]],
-    [[maxX, maxY], [minX, maxY]],
-    [[minX, maxY], [minX, minY]]
-  ]
+  return attempts
+    .map((attempt, index) => {
+      const highlightRing = attempt?.highlight_ring
+      const normalizedRing = Array.isArray(highlightRing) && highlightRing.length >= 3
+        ? highlightRing.map((point) => [normalize(point[0]), normalize(point[1])])
+        : null
+      const bounds = attempt?.bounds
+      if ((!Array.isArray(bounds) || bounds.length < 4) && !normalizedRing) {
+        return null
+      }
+
+      const ring = normalizedRing ?? (() => {
+        const [minX, minY, maxX, maxY] = bounds.map(normalize)
+        return [
+          [minX, minY],
+          [maxX, minY],
+          [maxX, maxY],
+          [minX, maxY],
+          [minX, minY]
+        ]
+      })()
+
+      return {
+        id: `${attempt.source ?? 'candidate'}-${attempt.kind ?? 'unknown'}-${index}`,
+        decision: attempt.decision ?? 'uncertain',
+        confidence: attempt.confidence ?? 0,
+        source: attempt.source ?? 'unknown',
+        kind: attempt.kind ?? 'unknown',
+        reason: attempt.reason ?? '',
+        ring
+      }
+    })
+    .filter(Boolean)
 }
 
-function transformPreprocessingDebugToViewerUnits(metadata) {
+function transformCleanupBoundariesToViewerUnits(metadata, fallbackBoundary = null) {
+  const cleanup = metadata?.processing_details?.outline_extraction?.vision_cleanup
   const scale = metadata?.unit_scale_to_mm ?? DEFAULT_UNIT_SCALE_TO_MM
-  const preprocessing = metadata?.processing_details?.preprocessing
+  const normalize = (value) => (!Number.isFinite(scale) || scale === 0 || scale === 1 ? value : value / scale)
+  const normalizeRing = (ring) => (
+    Array.isArray(ring) && ring.length >= 2
+      ? ring.map((point) => [normalize(point[0]), normalize(point[1])])
+      : null
+  )
 
   return {
-    workAreaSegments: bboxToSegments(preprocessing?.work_area_bbox, scale),
-    titleBlockSegments: bboxToSegments(preprocessing?.title_block_bbox, scale),
-    titleBlockCandidateSegments: bboxToSegments(preprocessing?.title_block_candidate_bbox, scale)
+    initialBoundary: normalizeRing(cleanup?.initial_boundary_exterior),
+    correctedBoundary: normalizeRing(cleanup?.final_boundary_exterior)
+      ?? fallbackBoundary?.exterior
+      ?? null
   }
+}
+
+function transformAiCleanupStepsToViewerUnits(metadata) {
+  const attempts = metadata?.processing_details?.outline_extraction?.vision_cleanup?.attempts
+
+  if (!Array.isArray(attempts) || attempts.length === 0) {
+    return []
+  }
+
+  const scale = metadata?.unit_scale_to_mm ?? DEFAULT_UNIT_SCALE_TO_MM
+  const normalize = (value) => (!Number.isFinite(scale) || scale === 0 || scale === 1 ? value : value / scale)
+  const normalizeRing = (ring) => (
+    Array.isArray(ring) && ring.length >= 2
+      ? ring.map((point) => [normalize(point[0]), normalize(point[1])])
+      : null
+  )
+
+  return attempts.map((attempt, index) => ({
+    id: `${attempt.source ?? 'candidate'}-${attempt.kind ?? 'unknown'}-${index}`,
+    stepIndex: index,
+    decision: attempt.decision ?? 'uncertain',
+    confidence: attempt.confidence ?? 0,
+    source: attempt.source ?? 'unknown',
+    kind: attempt.kind ?? 'unknown',
+    reason: attempt.reason ?? '',
+    highlightRing: normalizeRing(attempt.highlight_ring),
+    beforeBoundary: normalizeRing(attempt.before_boundary_exterior),
+    afterBoundary: normalizeRing(attempt.after_boundary_exterior)
+  }))
 }
 
 function DxfViewerComponent({ dxfFile }) {
@@ -132,7 +154,13 @@ function DxfViewerComponent({ dxfFile }) {
   const [isPreprocessing, setIsPreprocessing] = useState(false)
   const [isDetecting, setIsDetecting] = useState(false)
   const [error, setError] = useState(null)
-  const [viewMode, setViewMode] = useState(VIEW_MODES.ORIGINAL)
+  const [baseViewMode, setBaseViewMode] = useState(BASE_VIEW_MODES.ORIGINAL)
+  const [selectedAiCleanupStepIndex, setSelectedAiCleanupStepIndex] = useState(null)
+  const [overlayVisibility, setOverlayVisibility] = useState({
+    initialBoundary: true,
+    aiDetections: true,
+    correctedBoundary: true
+  })
 
   const fitViewerToBounds = useCallback((viewer, nextBounds) => {
     if (!viewer || !nextBounds) {
@@ -279,7 +307,13 @@ function DxfViewerComponent({ dxfFile }) {
   useEffect(() => {
     setProcessingData(null)
     setError(null)
-    setViewMode(VIEW_MODES.ORIGINAL)
+    setBaseViewMode(BASE_VIEW_MODES.ORIGINAL)
+    setSelectedAiCleanupStepIndex(null)
+    setOverlayVisibility({
+      initialBoundary: true,
+      aiDetections: true,
+      correctedBoundary: true
+    })
   }, [dxfFile])
 
   useEffect(() => {
@@ -288,9 +322,9 @@ function DxfViewerComponent({ dxfFile }) {
     }
     applyDrawingVisibility(
       viewerRef.current,
-      viewMode !== VIEW_MODES.PREPROCESSED && viewMode !== VIEW_MODES.OVERLAY
+      baseViewMode !== BASE_VIEW_MODES.PREPROCESSED
     )
-  }, [applyDrawingVisibility, viewMode])
+  }, [applyDrawingVisibility, baseViewMode])
 
   const handleResetView = () => {
     if (viewerRef.current && bounds) {
@@ -310,10 +344,12 @@ function DxfViewerComponent({ dxfFile }) {
         boundary: null,
         preprocessed: transformPreprocessedToViewerUnits(result.preprocessed, result.metadata),
         metadata: result.metadata,
-        extensionHighlights: transformExtensionHighlightsToViewerUnits(result.metadata),
-        preprocessingDebug: transformPreprocessingDebugToViewerUnits(result.metadata)
+        aiCleanupHighlights: transformVisionCleanupHighlightsToViewerUnits(result.metadata),
+        aiCleanupSteps: transformAiCleanupStepsToViewerUnits(result.metadata),
+        cleanupBoundaries: transformCleanupBoundariesToViewerUnits(result.metadata)
       })
-      setViewMode(VIEW_MODES.PREPROCESSED)
+      setSelectedAiCleanupStepIndex(null)
+      setBaseViewMode(BASE_VIEW_MODES.PREPROCESSED)
       console.log('Preprocessing complete:', result)
     } catch (err) {
       console.error('Preprocessing failed:', err)
@@ -331,14 +367,17 @@ function DxfViewerComponent({ dxfFile }) {
 
     try {
       const result = await detectBoundary(dxfFile)
+      const boundary = transformBoundaryToViewerUnits(result.boundary, result.metadata)
       setProcessingData({
         ...result,
-        boundary: transformBoundaryToViewerUnits(result.boundary, result.metadata),
+        boundary,
         preprocessed: transformPreprocessedToViewerUnits(result.preprocessed, result.metadata),
-        extensionHighlights: transformExtensionHighlightsToViewerUnits(result.metadata),
-        preprocessingDebug: transformPreprocessingDebugToViewerUnits(result.metadata)
+        aiCleanupHighlights: transformVisionCleanupHighlightsToViewerUnits(result.metadata),
+        aiCleanupSteps: transformAiCleanupStepsToViewerUnits(result.metadata),
+        cleanupBoundaries: transformCleanupBoundariesToViewerUnits(result.metadata, boundary)
       })
-      setViewMode(VIEW_MODES.BOUNDARY)
+      setSelectedAiCleanupStepIndex(null)
+      setBaseViewMode(BASE_VIEW_MODES.ORIGINAL)
       console.log('Boundary detected:', result)
     } catch (err) {
       console.error('Boundary detection failed:', err)
@@ -348,15 +387,36 @@ function DxfViewerComponent({ dxfFile }) {
     }
   }, [dxfFile])
 
-  const handleChangeViewMode = useCallback((nextMode) => {
-    setViewMode(nextMode)
+  const handleChangeBaseViewMode = useCallback((nextMode) => {
+    setBaseViewMode(nextMode)
+  }, [])
+
+  const handleToggleOverlay = useCallback((overlayKey) => {
+    setOverlayVisibility((current) => ({
+      ...current,
+      [overlayKey]: !current[overlayKey]
+    }))
   }, [])
 
   const handleClearBoundary = useCallback(() => {
     setProcessingData(null)
     setError(null)
-    setViewMode(VIEW_MODES.ORIGINAL)
+    setBaseViewMode(BASE_VIEW_MODES.ORIGINAL)
+    setSelectedAiCleanupStepIndex(null)
+    setOverlayVisibility({
+      initialBoundary: true,
+      aiDetections: true,
+      correctedBoundary: true
+    })
   }, [])
+
+  const handleSelectAiCleanupStep = useCallback((stepIndex) => {
+    setSelectedAiCleanupStepIndex(stepIndex)
+  }, [])
+
+  const selectedAiCleanupStep = selectedAiCleanupStepIndex === null
+    ? null
+    : processingData?.aiCleanupSteps?.[selectedAiCleanupStepIndex] ?? null
 
   return (
     <div className="dxf-viewer">
@@ -383,8 +443,13 @@ function DxfViewerComponent({ dxfFile }) {
         error={error}
         hasBoundary={Boolean(processingData?.boundary?.exterior?.length)}
         hasPreprocessed={Boolean(processingData?.preprocessed?.segments?.length)}
-        viewMode={viewMode}
-        onChangeViewMode={handleChangeViewMode}
+        aiCleanupSteps={processingData?.aiCleanupSteps ?? []}
+        selectedAiCleanupStepIndex={selectedAiCleanupStepIndex}
+        onSelectAiCleanupStep={handleSelectAiCleanupStep}
+        baseViewMode={baseViewMode}
+        onChangeBaseViewMode={handleChangeBaseViewMode}
+        overlayVisibility={overlayVisibility}
+        onToggleOverlay={handleToggleOverlay}
         onClear={handleClearBoundary}
       />
 
@@ -410,55 +475,36 @@ function DxfViewerComponent({ dxfFile }) {
         <SegmentOverlay
           viewer={viewerRef.current}
           segments={processingData.preprocessed.segments}
-          visible={viewMode === VIEW_MODES.PREPROCESSED}
+          visible={baseViewMode === BASE_VIEW_MODES.PREPROCESSED}
           name="preprocessed-overlay"
           color="#147d64"
           opacity={0.96}
         />
       )}
 
-      {viewerRef.current && processingData?.preprocessingDebug?.workAreaSegments?.length > 0 && (
-        <SegmentOverlay
-          viewer={viewerRef.current}
-          segments={processingData.preprocessingDebug.workAreaSegments}
-          visible={viewMode === VIEW_MODES.PREPROCESSED}
-          name="work-area-overlay"
-          color="#2563eb"
-          opacity={0.9}
-        />
-      )}
-
-      {viewerRef.current && processingData?.preprocessingDebug?.titleBlockCandidateSegments?.length > 0 && (
-        <SegmentOverlay
-          viewer={viewerRef.current}
-          segments={processingData.preprocessingDebug.titleBlockCandidateSegments}
-          visible={viewMode === VIEW_MODES.PREPROCESSED}
-          name="title-block-candidate-overlay"
-          color="#f59e0b"
-          opacity={0.88}
-        />
-      )}
-
-      {viewerRef.current && processingData?.preprocessingDebug?.titleBlockSegments?.length > 0 && (
-        <SegmentOverlay
-          viewer={viewerRef.current}
-          segments={processingData.preprocessingDebug.titleBlockSegments}
-          visible={viewMode === VIEW_MODES.PREPROCESSED}
-          name="title-block-overlay"
-          color="#dc2626"
-          opacity={0.92}
-        />
-      )}
-
-      {/* Boundary overlay rendered in the same Three.js scene as the DXF */}
-      {viewerRef.current && processingData?.boundary && (
+      {viewerRef.current && (
         <BoundaryOverlay
           viewer={viewerRef.current}
-          boundary={processingData.boundary}
-          extensionHighlights={processingData.extensionHighlights}
-          visible={viewMode === VIEW_MODES.BOUNDARY || viewMode === VIEW_MODES.OVERLAY}
-          showInteriors={false}
-          colors={{ exterior: '#0B3EA8', interior: '#0B3EA8', extension: '#FF7A00' }}
+          initialBoundary={processingData?.cleanupBoundaries?.initialBoundary}
+          correctedBoundary={processingData?.cleanupBoundaries?.correctedBoundary}
+          aiCleanupHighlights={processingData?.aiCleanupHighlights ?? []}
+          aiCleanupStep={selectedAiCleanupStep}
+          visible={
+            overlayVisibility.initialBoundary
+            || overlayVisibility.aiDetections
+            || overlayVisibility.correctedBoundary
+          }
+          showInitialBoundary={overlayVisibility.initialBoundary}
+          showAiDetections={overlayVisibility.aiDetections}
+          showCorrectedBoundary={overlayVisibility.correctedBoundary}
+          colors={{
+            initial: '#64748B',
+            corrected: '#0B3EA8',
+            aiRemove: '#DC2626',
+            aiKeep: '#F59E0B',
+            aiUncertain: '#6B7280',
+            aiHighlight: '#DC2626'
+          }}
         />
       )}
 

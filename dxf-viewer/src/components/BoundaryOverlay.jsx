@@ -6,16 +6,27 @@ import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js'
 
 function BoundaryOverlay({
   viewer,
-  boundary,
-  extensionHighlights = [],
+  initialBoundary = null,
+  correctedBoundary = null,
+  aiCleanupHighlights = [],
+  aiCleanupStep = null,
+  showInitialBoundary = false,
+  showAiDetections = false,
+  showCorrectedBoundary = true,
   visible = true,
-  showInteriors = false,
-  colors = { exterior: '#0b3ea8', interior: '#0b3ea8', extension: '#ff7a00' }
+  colors = {
+    initial: '#64748b',
+    corrected: '#0b3ea8',
+    aiRemove: '#dc2626',
+    aiKeep: '#f59e0b',
+    aiUncertain: '#6b7280',
+    aiHighlight: '#dc2626'
+  }
 }) {
   const overlayGroupRef = useRef(null)
 
   useEffect(() => {
-    if (!viewer || !boundary) {
+    if (!viewer) {
       return undefined
     }
 
@@ -88,30 +99,48 @@ function BoundaryOverlay({
       }
     }
 
-    const exteriorLine = buildLine(boundary.exterior, colors.exterior, 0.9)
-    if (exteriorLine) {
-      overlayGroup.add(exteriorLine)
-    }
+    const activeInitialBoundary = aiCleanupStep?.beforeBoundary ?? initialBoundary
+    const activeCorrectedBoundary = aiCleanupStep?.afterBoundary ?? correctedBoundary
 
-    if (showInteriors) {
-      for (const interior of boundary.interiors ?? []) {
-        const interiorLine = buildLine(interior, colors.interior, 0.8)
-        if (interiorLine) {
-          overlayGroup.add(interiorLine)
-        }
+    if (showInitialBoundary) {
+      const initialLine = buildLine(activeInitialBoundary, colors.initial, 0.74, 4.0)
+      if (initialLine) {
+        overlayGroup.add(initialLine)
       }
     }
 
-    for (const highlight of extensionHighlights) {
-      const extensionLine = buildLine(
-        [highlight.fromPoint, highlight.toPoint],
-        colors.extension,
-        0.95,
-        6.4
-      )
+    if (showCorrectedBoundary) {
+      const correctedLine = buildLine(activeCorrectedBoundary, colors.corrected, 0.94, 5.0)
+      if (correctedLine) {
+        overlayGroup.add(correctedLine)
+      }
+    }
 
-      if (extensionLine) {
-        overlayGroup.add(extensionLine)
+    const aiColorByDecision = {
+      remove: colors.aiRemove,
+      keep: colors.aiKeep,
+      uncertain: colors.aiUncertain
+    }
+
+    if (showAiDetections) {
+      const visibleHighlights = aiCleanupStep
+        ? [{
+            decision: aiCleanupStep.decision,
+            ring: aiCleanupStep.highlightRing
+          }]
+        : aiCleanupHighlights
+
+      for (const highlight of visibleHighlights) {
+        const aiLine = buildLine(
+          highlight.ring,
+          aiColorByDecision[highlight.decision] ?? colors.aiHighlight ?? colors.aiUncertain,
+          highlight.decision === 'remove' ? 0.95 : 0.82,
+          highlight.decision === 'remove' ? 6.8 : 5.2
+        )
+
+        if (aiLine) {
+          overlayGroup.add(aiLine)
+        }
       }
     }
 
@@ -135,7 +164,22 @@ function BoundaryOverlay({
       overlayGroupRef.current = null
       viewer.Render()
     }
-  }, [boundary, colors.exterior, colors.extension, colors.interior, extensionHighlights, showInteriors, viewer])
+  }, [
+    aiCleanupStep,
+    aiCleanupHighlights,
+    colors.aiKeep,
+    colors.aiHighlight,
+    colors.aiRemove,
+    colors.aiUncertain,
+    colors.corrected,
+    colors.initial,
+    correctedBoundary,
+    initialBoundary,
+    showAiDetections,
+    showCorrectedBoundary,
+    showInitialBoundary,
+    viewer
+  ])
 
   useEffect(() => {
     if (!overlayGroupRef.current || !viewer) {

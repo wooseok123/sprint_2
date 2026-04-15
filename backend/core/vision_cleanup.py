@@ -38,6 +38,8 @@ class VisionCleanupCandidate:
     span_end_idx: Optional[int] = None
     span_reason: str = ""
     span_confidence: float = 0.0
+    span_feature_hint: str = ""
+    span_vertices: Tuple[Tuple[float, float], ...] = ()
 
 
 class GeminiVisionJudge:
@@ -183,10 +185,12 @@ class GeminiVisionJudge:
             "Remove only when the feature is clearly an artifact such as:\n"
             "- a thin spike or whisker\n"
             "- a door swing, door leaf, or triangular flap\n"
+            "- a smooth fan-shaped, circular, or arc-like bulge where connecting the endpoints with a straight chord would create a more natural boundary\n"
             "- a tiny outward detour unsupported by surrounding wall mass\n"
             "Keep when the feature could plausibly be a legitimate footprint step, balcony, annex, or wall offset.\n"
             "If the evidence is mixed or insufficient, return uncertain.\n"
             "Never infer visual cues that are not present in the feature JSON.\n"
+            "When chain_vs_chord metrics are present, use them heavily.\n"
             "Prefer conservative decisions.\n"
         )
         user_payload = {
@@ -199,7 +203,7 @@ class GeminiVisionJudge:
             "Candidate feature JSON:\n"
             f"{json.dumps(user_payload, indent=2, sort_keys=True)}\n\n"
             "Respond with JSON only using this schema:\n"
-            '{"decision":"keep|remove|uncertain","confidence":0.0,"feature_type":"door_arc|door_leaf|thin_spike|legit_mass|unclear","reason":"short explanation"}'
+            '{"decision":"keep|remove|uncertain","confidence":0.0,"feature_type":"door_arc|door_leaf|thin_spike|smooth_bulge|triangle_flap|legit_mass|unclear","reason":"short explanation"}'
         )
 
     def _build_global_scan_prompt(
@@ -213,7 +217,8 @@ class GeminiVisionJudge:
             "You are a conservative CAD exterior-boundary anomaly scanner.\n"
             "You receive a simplified exterior boundary summary for a floor-plan footprint.\n"
             "Your task is to identify outward spans that may be artifacts.\n"
-            "Examples include thin spikes, triangular door-leaf flaps, door-swing bulges, or small unsupported protrusions.\n"
+            "Examples include thin spikes, triangular door-leaf flaps, door-swing bulges, smooth fan-shaped or circular protrusions, or small unsupported outward detours.\n"
+            "Flag spans where replacing the span by a straight chord between its endpoints would likely create a more natural exterior boundary.\n"
             "Do not flag normal footprint steps, balconies, or plausible wall offsets unless they look clearly anomalous.\n"
             "Prefer conservative results. If unsure, return fewer spans.\n"
             "Indices refer to the simplified_exterior_vertices list.\n"
@@ -225,7 +230,7 @@ class GeminiVisionJudge:
             "Outline summary JSON:\n"
             f"{json.dumps(compact_payload, separators=(',', ':'), sort_keys=True)}\n\n"
             f"Respond with JSON only using this schema (max {max_spans} items):\n"
-            '{"suspicious_spans":[{"start_idx":0,"end_idx":0,"confidence":0.0,"feature_hint":"thin_spike|door_like|triangle_flap|unclear","reason":"short explanation"}]}'
+            '{"suspicious_spans":[{"start_idx":0,"end_idx":0,"confidence":0.0,"feature_hint":"thin_spike|door_like|triangle_flap|smooth_bulge|unclear","reason":"short explanation"}]}'
         )
 
     def _parse_suspicious_spans_json(self, text: str) -> List[Dict[str, Any]]:
@@ -286,6 +291,8 @@ def maybe_apply_gemini_vision_cleanup(
         "min_confidence": 0.0,
         "skipped_reason": None,
         "attempts": [],
+        "initial_boundary_exterior": _polygon_exterior_coords_or_none(polygon),
+        "final_boundary_exterior": _polygon_exterior_coords_or_none(polygon),
         "global_scan": {
             "attempted": False,
             "proposed_count": 0,
@@ -359,6 +366,9 @@ def maybe_apply_gemini_vision_cleanup(
             "kind": candidate.kind,
             "source": candidate.source,
             "bounds": [float(value) for value in candidate.bounds],
+            "highlight_ring": _polygon_ring_or_none(candidate.mask_polygon),
+            "before_boundary_exterior": _polygon_exterior_coords_or_none(current_polygon),
+            "after_boundary_exterior": None,
             "feature_payload": candidate_metrics,
             "decision": "keep",
             "confidence": 0.0,
@@ -404,11 +414,13 @@ def maybe_apply_gemini_vision_cleanup(
         current_polygon = cleaned_polygon
         metadata["applied"] = True
         metadata["applied_count"] += 1
+        attempt_meta["after_boundary_exterior"] = _polygon_exterior_coords_or_none(current_polygon)
         metadata["attempts"].append(attempt_meta)
 
     if not metadata["applied"] and metadata["attempted"]:
         metadata["skipped_reason"] = "all_candidates_kept"
 
+    metadata["final_boundary_exterior"] = _polygon_exterior_coords_or_none(current_polygon)
     return current_polygon, metadata
 
 
@@ -622,17 +634,23 @@ def _candidate_from_outline_proposal(
     span_length = 0.0
     for left, right in zip(span_vertices, span_vertices[1:]):
         span_length += math.hypot(right["x"] - left["x"], right["y"] - left["y"])
+    world_span_vertices = tuple((float(vertex["x"] + origin_x), float(vertex["y"] + origin_y)) for vertex in span_vertices)
+    span_mask_polygon = _span_mask_polygon(world_span_vertices)
+    if span_mask_polygon is not None and not span_mask_polygon.is_empty:
+        bounds = tuple(float(value) for value in span_mask_polygon.bounds)
 
     return VisionCleanupCandidate(
         kind=kind,
         source="global_outline_scan",
         bounds=bounds,
-        mask_polygon=None,
+        mask_polygon=span_mask_polygon,
         score_hint=max(span_length, _bounds_area(bounds)) * max(confidence, 0.25),
         span_start_idx=start_idx,
         span_end_idx=end_idx,
         span_reason=str(proposal.get("reason", "")).strip(),
         span_confidence=max(0.0, min(1.0, confidence)),
+        span_feature_hint=feature_hint,
+        span_vertices=world_span_vertices,
     )
 
 
@@ -715,10 +733,22 @@ def _apply_candidate_cleanup(
                 cleaned=cleaned,
                 method="mask_difference",
             )
+            meta["guard_reasons"] = _relax_global_span_mask_guards(
+                candidate=candidate,
+                original=polygon,
+                meta=meta,
+            )
             cleanup_attempts.append(meta)
             if not meta["guard_reasons"]:
                 best_polygon = cleaned
                 best_meta = meta
+
+    prefer_mask_cleanup = (
+        candidate.source == "global_outline_scan"
+        and candidate.mask_polygon is not None
+        and best_meta is not None
+        and best_meta["method"] == "mask_difference"
+    )
 
     local_cleaned = _apply_local_opening_cleanup(
         polygon=polygon,
@@ -728,7 +758,7 @@ def _apply_candidate_cleanup(
     if local_cleaned is not None:
         cleaned_polygon, meta = local_cleaned
         cleanup_attempts.append(meta)
-        if not meta["guard_reasons"] and (
+        if not meta["guard_reasons"] and not prefer_mask_cleanup and (
             best_meta is None or meta["area_delta"] > best_meta["area_delta"]
         ):
             best_polygon = cleaned_polygon
@@ -835,6 +865,7 @@ def _candidate_feature_payload(
         "global_span_end_idx": candidate.span_end_idx,
         "global_span_reason": candidate.span_reason,
         "global_span_confidence": float(candidate.span_confidence),
+        "global_span_feature_hint": candidate.span_feature_hint,
         "wall_thickness_mm": float(wall_thickness),
         "width_mm": float(width),
         "height_mm": float(height),
@@ -852,6 +883,10 @@ def _candidate_feature_payload(
     if candidate.mask_polygon is not None and not candidate.mask_polygon.is_empty:
         payload.update(_mask_polygon_features(candidate.mask_polygon, wall_thickness))
 
+    chain_features = _span_chain_features(candidate, polygon, wall_thickness)
+    if chain_features:
+        payload["chain_vs_chord"] = chain_features
+
     payload.update(
         _roi_segment_features(
             reference_segments=reference_segments,
@@ -860,6 +895,106 @@ def _candidate_feature_payload(
         )
     )
     return payload
+
+
+def _span_chain_features(
+    candidate: VisionCleanupCandidate,
+    polygon: Polygon,
+    wall_thickness: float,
+) -> Optional[Dict[str, Any]]:
+    span_vertices = list(candidate.span_vertices or ())
+    if len(span_vertices) < 2:
+        return None
+
+    start = span_vertices[0]
+    end = span_vertices[-1]
+    chord_dx = end[0] - start[0]
+    chord_dy = end[1] - start[1]
+    chord_length = math.hypot(chord_dx, chord_dy)
+    detour_length = sum(
+        math.hypot(right[0] - left[0], right[1] - left[1])
+        for left, right in zip(span_vertices, span_vertices[1:])
+    )
+    chord_orientation = math.degrees(math.atan2(chord_dy, chord_dx)) if chord_length > 1e-6 else 0.0
+
+    local_origin_x = min(point[0] for point in span_vertices)
+    local_origin_y = min(point[1] for point in span_vertices)
+    local_vertices = [
+        [round(point[0] - local_origin_x, 1), round(point[1] - local_origin_y, 1)]
+        for point in span_vertices
+    ]
+    chord_local = {
+        "start": [round(start[0] - local_origin_x, 1), round(start[1] - local_origin_y, 1)],
+        "end": [round(end[0] - local_origin_x, 1), round(end[1] - local_origin_y, 1)],
+    }
+
+    offsets: List[float] = []
+    abs_offsets: List[float] = []
+    if chord_length > 1e-6:
+        for point in span_vertices[1:-1]:
+            signed_offset = ((point[0] - start[0]) * chord_dy - (point[1] - start[1]) * chord_dx) / chord_length
+            offsets.append(signed_offset)
+            abs_offsets.append(abs(signed_offset))
+
+    dominant_side_ratio = 0.0
+    if offsets:
+        positive_count = sum(1 for value in offsets if value > 1e-6)
+        negative_count = sum(1 for value in offsets if value < -1e-6)
+        dominant_side_ratio = max(positive_count, negative_count) / max(len(offsets), 1)
+
+    turning_angles: List[float] = []
+    for left, middle, right in zip(span_vertices, span_vertices[1:], span_vertices[2:]):
+        vector_a = (middle[0] - left[0], middle[1] - left[1])
+        vector_b = (right[0] - middle[0], right[1] - middle[1])
+        magnitude_a = math.hypot(*vector_a)
+        magnitude_b = math.hypot(*vector_b)
+        if magnitude_a <= 1e-6 or magnitude_b <= 1e-6:
+            continue
+        cross = vector_a[0] * vector_b[1] - vector_a[1] * vector_b[0]
+        dot = vector_a[0] * vector_b[0] + vector_a[1] * vector_b[1]
+        turning_angles.append(math.degrees(math.atan2(cross, dot)))
+
+    same_turn_ratio = 0.0
+    if turning_angles:
+        positive_turns = sum(1 for angle in turning_angles if angle > 5.0)
+        negative_turns = sum(1 for angle in turning_angles if angle < -5.0)
+        same_turn_ratio = max(positive_turns, negative_turns) / max(len(turning_angles), 1)
+
+    enclosed_area = 0.0
+    if len(span_vertices) >= 3:
+        try:
+            enclosed_area = abs(Polygon(span_vertices).area)
+        except Exception:
+            enclosed_area = 0.0
+
+    max_offset = max(abs_offsets) if abs_offsets else 0.0
+    mean_offset = sum(abs_offsets) / len(abs_offsets) if abs_offsets else 0.0
+    detour_ratio = detour_length / max(chord_length, 1e-6)
+
+    return {
+        "span_vertex_count": len(span_vertices),
+        "span_vertices_local": local_vertices,
+        "chord_local": chord_local,
+        "chord_length_mm": float(chord_length),
+        "detour_length_mm": float(detour_length),
+        "detour_to_chord_ratio": float(detour_ratio),
+        "max_offset_from_chord_mm": float(max_offset),
+        "mean_offset_from_chord_mm": float(mean_offset),
+        "max_offset_to_wall_ratio": float(max_offset / max(wall_thickness, 1e-6)),
+        "dominant_side_ratio": float(dominant_side_ratio),
+        "same_turn_ratio": float(same_turn_ratio),
+        "turning_angles_deg": [round(angle, 1) for angle in turning_angles],
+        "enclosed_area_mm2": float(enclosed_area),
+        "enclosed_area_ratio_of_polygon": float(enclosed_area / max(polygon.area, 1e-6)),
+        "chord_orientation_deg": float(chord_orientation),
+        "looks_like_smooth_bulge": bool(
+            len(span_vertices) >= 3
+            and detour_ratio >= 1.05
+            and max_offset > 1e-3
+            and dominant_side_ratio >= 0.8
+            and same_turn_ratio >= 0.6
+        ),
+    }
 
 
 def _mask_polygon_features(mask_polygon: Polygon, wall_thickness: float) -> Dict[str, Any]:
@@ -1054,3 +1189,66 @@ def _convex_hull_ratio(polygon: Polygon) -> float:
     if hull.is_empty or hull.area <= 0:
         return 1.0
     return polygon.area / hull.area
+
+
+def _relax_global_span_mask_guards(
+    *,
+    candidate: VisionCleanupCandidate,
+    original: Polygon,
+    meta: Dict[str, Any],
+) -> List[str]:
+    guard_reasons = list(meta.get("guard_reasons", []))
+    if candidate.source != "global_outline_scan" or candidate.mask_polygon is None:
+        return guard_reasons
+
+    allowed = {"bbox_drop_exceeded", "hull_ratio_delta_exceeded"}
+    if not guard_reasons or any(reason not in allowed for reason in guard_reasons):
+        return guard_reasons
+
+    if meta.get("hole_delta") != 0:
+        return guard_reasons
+    if meta.get("area_ratio", 0.0) < 0.88:
+        return guard_reasons
+    if candidate.mask_polygon.area / max(original.area, 1e-6) > 0.12:
+        return guard_reasons
+    if len(candidate.span_vertices) < 3:
+        return guard_reasons
+
+    return []
+
+
+def _span_mask_polygon(
+    span_vertices: Sequence[Tuple[float, float]],
+) -> Optional[Polygon]:
+    if len(span_vertices) < 3:
+        return None
+
+    try:
+        polygon = Polygon(span_vertices)
+    except Exception:
+        return None
+
+    if polygon.is_empty or polygon.area <= 0:
+        return None
+
+    if not polygon.is_valid:
+        polygon = polygon.buffer(0)
+        if polygon.is_empty:
+            return None
+        polygon = _select_polygon(polygon)
+        if polygon is None or polygon.is_empty or polygon.area <= 0:
+            return None
+
+    return polygon
+
+
+def _polygon_ring_or_none(polygon: Optional[Polygon]) -> Optional[List[List[float]]]:
+    if polygon is None or polygon.is_empty:
+        return None
+    return [[float(x), float(y)] for x, y in polygon.exterior.coords]
+
+
+def _polygon_exterior_coords_or_none(polygon: Optional[Polygon]) -> Optional[List[List[float]]]:
+    if polygon is None or polygon.is_empty:
+        return None
+    return [[float(x), float(y)] for x, y in polygon.exterior.coords]
