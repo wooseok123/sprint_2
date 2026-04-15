@@ -480,6 +480,36 @@ class TestDXFPreprocessor:
         }
         assert processed.preprocessing["removed_isolated_segments"] >= 1
 
+    def test_preprocess_removes_floating_single_segment_before_frame_cleanup(self):
+        doc = self._new_doc()
+        msp = doc.modelspace()
+
+        msp.add_lwpolyline([(0, 0), (1000, 0), (1000, 800), (0, 800)], close=True)
+        msp.add_line((320, 300), (380, 300))
+
+        processed = self._preprocess_document(doc, run_isolated_segment_cleanup=False)
+
+        assert processed.preprocessing["removed_floating_segments"] == 1
+        assert not any(
+            {segment.start.to_2d(), segment.end.to_2d()} == {(320.0, 300.0), (380.0, 300.0)}
+            for segment in processed.segments
+        )
+
+    def test_preprocess_keeps_t_junction_segment_when_endpoint_hits_other_geometry(self):
+        doc = self._new_doc()
+        msp = doc.modelspace()
+
+        msp.add_lwpolyline([(0, 0), (1000, 0), (1000, 800), (0, 800)], close=True)
+        msp.add_line((500, 0), (500, 220))
+
+        processed = self._preprocess_document(doc, run_isolated_segment_cleanup=False)
+
+        assert processed.preprocessing["removed_floating_segments"] == 0
+        assert any(
+            {segment.start.to_2d(), segment.end.to_2d()} == {(500.0, 0.0), (500.0, 220.0)}
+            for segment in processed.segments
+        )
+
     def test_preprocess_can_defer_isolated_detail_cleanup(self):
         doc = self._new_doc()
         msp = doc.modelspace()
