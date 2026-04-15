@@ -259,7 +259,7 @@ async def detect_boundary(file: UploadFile = File(...)):
             graph, snapped_segments = graph_processor.build_graph_and_snap(noded_segments)
 
             # STEP 5 (auxiliary): prune only short dangling spurs for diagnostics
-            logger.info("STEP 5: Pruning short dangling spurs...")
+            logger.info("STEP 5: Pruning graph artifacts...")
             graph_metrics = graph_processor.prune_dangling_edges(max_iterations=1000)
 
             pruned_segments = graph_processor.get_active_segments(snapped_segments)
@@ -274,6 +274,7 @@ async def detect_boundary(file: UploadFile = File(...)):
                 f"({graph_metrics.pruned_percent:.1f}%), "
                 f"{graph_metrics.components} components, "
                 f"max degree {graph_metrics.max_degree}, "
+                f"removed_small_components={graph_metrics.removed_small_components}, "
                 f"outline_input_segments={len(pruned_segments)}"
             )
 
@@ -477,6 +478,8 @@ async def detect_boundary(file: UploadFile = File(...)):
                         "pruned_percent": round(graph_metrics.pruned_percent, 3),
                         "components": graph_metrics.components,
                         "max_degree": graph_metrics.max_degree,
+                        "removed_small_components": graph_metrics.removed_small_components,
+                        "removed_small_component_edges": graph_metrics.removed_small_component_edges,
                         "outline_input_segments": len(pruned_segments),
                     },
                     "outline_extraction": merge_metadata,

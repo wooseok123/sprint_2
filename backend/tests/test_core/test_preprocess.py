@@ -79,7 +79,47 @@ class TestDXFPreprocessor:
             "maxY": 0.0,
         }
 
-    def test_preprocess_keeps_context_only_annotation_like_line_without_position_signal(self):
+    def test_preprocess_skips_mark_and_text_named_layers(self):
+        doc = self._new_doc()
+        doc.layers.add("A-WAL")
+        doc.layers.add("A-MARK")
+        doc.layers.add("A-TEXT")
+
+        msp = doc.modelspace()
+        msp.add_line((0, 0), (100, 0), dxfattribs={"layer": "A-WAL"})
+        msp.add_line((40, -20), (40, 80), dxfattribs={"layer": "A-MARK"})
+        msp.add_line((60, -20), (60, 80), dxfattribs={"layer": "A-TEXT"})
+
+        processed = self._preprocess_document(doc)
+
+        assert len(processed.segments) == 1
+        assert processed.preprocessing["removed_by_annotation"] >= 2
+        assert processed.bbox == {
+            "minX": 0.0,
+            "minY": 0.0,
+            "maxX": 100.0,
+            "maxY": 0.0,
+        }
+
+    def test_preprocess_keeps_wall_layer_even_if_text_keyword_is_present(self):
+        doc = self._new_doc()
+        doc.layers.add("A-WALL-TEXT")
+
+        msp = doc.modelspace()
+        msp.add_line((0, 0), (100, 0), dxfattribs={"layer": "A-WALL-TEXT"})
+
+        processed = self._preprocess_document(doc)
+
+        assert len(processed.segments) == 1
+        assert processed.preprocessing["removed_by_annotation"] == 0
+        assert processed.bbox == {
+            "minX": 0.0,
+            "minY": 0.0,
+            "maxX": 100.0,
+            "maxY": 0.0,
+        }
+
+    def test_preprocess_removes_dimension_layer_even_without_position_signal(self):
         doc = self._new_doc()
         doc.layers.add("A-WAL")
         doc.layers.add("A-DIM")
@@ -91,13 +131,13 @@ class TestDXFPreprocessor:
 
         processed = self._preprocess_document(doc)
 
-        assert processed.preprocessing["removed_by_annotation"] == 0
-        assert processed.bbox == {
-            "minX": 200.0,
-            "minY": 150.0,
-            "maxX": 1200.0,
-            "maxY": 850.0,
-        }
+        assert processed.preprocessing["removed_by_annotation"] >= 1
+        assert not any(
+            segment.start.x == 500.0
+            and segment.end.x == 500.0
+            and {segment.start.y, segment.end.y} == {250.0, 550.0}
+            for segment in processed.segments
+        )
 
     def test_preprocess_skips_centerline_linetype_lines(self):
         doc = self._new_doc()
@@ -175,7 +215,7 @@ class TestDXFPreprocessor:
         for y in (80, 120, 160, 200):
             msp.add_line((1700, y), (1900, y))
 
-        processed = self._preprocess_document(doc)
+        processed = self._preprocess_document(doc, run_isolated_segment_cleanup=True)
 
         assert processed.bbox == {
             "minX": 200.0,
@@ -358,6 +398,50 @@ class TestDXFPreprocessor:
         }
         assert processed.preprocessing["removed_by_border_frame"] == 3
 
+    def test_preprocess_removes_concentric_frames_outside_work_area_even_with_boundary_contacts(self):
+        doc = self._new_doc()
+        msp = doc.modelspace()
+
+        for inset in (0, 40, 80, 120):
+            msp.add_lwpolyline(
+                [(inset, inset), (1000 - inset, inset), (1000 - inset, 800 - inset), (inset, 800 - inset)],
+                close=True,
+            )
+        msp.add_lwpolyline([(200, 200), (800, 200), (800, 600), (200, 600)], close=True)
+
+        for x in (180, 260, 340, 420, 500, 580):
+            msp.add_line((x, 120), (x, 170))
+
+        msp.add_line((320, 320), (680, 320))
+        msp.add_line((320, 320), (320, 500))
+
+        processed = self._preprocess_document(doc)
+
+        assert processed.bbox == {
+            "minX": 320.0,
+            "minY": 320.0,
+            "maxX": 680.0,
+            "maxY": 500.0,
+        }
+        assert processed.preprocessing["work_area_bbox"] == {
+            "minX": 200.0,
+            "minY": 200.0,
+            "maxX": 800.0,
+            "maxY": 600.0,
+        }
+        assert processed.preprocessing["removed_by_border_frame"] >= 5
+        assert not any(
+            (
+                {segment.start.x, segment.end.x} == {120.0, 880.0}
+                and segment.start.y == segment.end.y == 120.0
+            )
+            or (
+                {segment.start.x, segment.end.x} == {120.0, 880.0}
+                and segment.start.y == segment.end.y == 680.0
+            )
+            for segment in processed.segments
+        )
+
     def test_preprocess_keeps_large_outer_rectangle_when_interior_geometry_touches_edges(self):
         doc = self._new_doc()
         msp = doc.modelspace()
@@ -395,6 +479,25 @@ class TestDXFPreprocessor:
             "maxY": 800.0,
         }
         assert processed.preprocessing["removed_isolated_segments"] >= 1
+
+    def test_preprocess_can_defer_isolated_detail_cleanup(self):
+        doc = self._new_doc()
+        msp = doc.modelspace()
+
+        msp.add_lwpolyline([(0, 0), (1000, 0), (1000, 800), (0, 800)], close=True)
+        msp.add_line((1800, 1700), (1820, 1700))
+        msp.add_line((1820, 1700), (1820, 1720))
+
+        processed = self._preprocess_document(doc, run_isolated_segment_cleanup=False)
+
+        assert processed.bbox == {
+            "minX": 0.0,
+            "minY": 0.0,
+            "maxX": 1820.0,
+            "maxY": 1720.0,
+        }
+        assert processed.preprocessing["removed_isolated_segments"] == 0
+        assert processed.preprocessing["isolated_segment_cleanup_deferred"] is True
 
     def test_preprocess_removes_detached_pure_rectangle(self):
         doc = self._new_doc()
@@ -452,7 +555,7 @@ class TestDXFPreprocessor:
         assert processed.preprocessing["removed_detached_rectangles"] == 1
         assert processed.preprocessing["removed_by_annotation"] >= 1
 
-    def _preprocess_document(self, doc):
+    def _preprocess_document(self, doc, *, run_isolated_segment_cleanup=True):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".dxf", delete=False) as handle:
             temp_path = handle.name
             doc.write(handle)
@@ -460,6 +563,9 @@ class TestDXFPreprocessor:
         try:
             parser = DXFParser(temp_path)
             parsed = parser.parse()
-            return DXFPreprocessor(parser).preprocess(parsed)
+            return DXFPreprocessor(parser).preprocess(
+                parsed,
+                run_isolated_segment_cleanup=run_isolated_segment_cleanup,
+            )
         finally:
             os.unlink(temp_path)

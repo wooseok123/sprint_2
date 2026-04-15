@@ -136,6 +136,39 @@ def test_graph_processor_prunes_t_junction_terminal_branch_beyond_short_spur_lim
     )
 
 
+def test_graph_processor_prunes_far_small_disconnected_component():
+    segments = [
+        _segment((0, 0), (1000, 0)),
+        _segment((1000, 0), (1000, 800)),
+        _segment((1000, 800), (0, 800)),
+        _segment((0, 800), (0, 0)),
+        _segment((1800, 1700), (1820, 1700)),
+        _segment((1820, 1700), (1820, 1720)),
+    ]
+    processor = GraphProcessor(
+        bbox={"minX": 0, "minY": 0, "maxX": 1820, "maxY": 1720},
+    )
+
+    _, snapped_segments = processor.build_graph_and_snap(segments)
+    metrics = processor.prune_dangling_edges()
+    active_segments = processor.get_active_segments(snapped_segments)
+
+    assert metrics.removed_small_components == 1
+    assert metrics.removed_small_component_edges == 2
+    assert len(active_segments) == 4
+    assert all(
+        {
+            active.start.to_2d(),
+            active.end.to_2d(),
+        } != {(1800, 1700), (1820, 1700)}
+        and {
+            active.start.to_2d(),
+            active.end.to_2d(),
+        } != {(1820, 1700), (1820, 1720)}
+        for active in active_segments
+    )
+
+
 def test_graph_processor_snapping_works_without_scipy(monkeypatch):
     monkeypatch.setattr(graph_module, "KDTree", None)
 

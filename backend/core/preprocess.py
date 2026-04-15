@@ -42,6 +42,9 @@ class DXFPreprocessor:
         "title", "tbl", "logo", "stamp", "room-iden", "room_iden", "roomiden",
         "표제", "치수", "중심", "통심", "해치", "일람",
     )
+    FORCED_DELETE_LAYER_KEYWORDS = (
+        "symbol", "sym", "annotation", "anno", "dimension", "dim", "text", "mtext", "mark",
+    )
     ANNOTATION_BLOCK_KEYWORDS = (
         "dim", "arrow", "tick", "leader", "table", "schedule",
         "title", "logo", "stamp", "표제", "일람",
@@ -65,6 +68,7 @@ class DXFPreprocessor:
     FRAME_MIN_INTERIOR_ENTITY_COUNT = 1
     FRAME_KEEP_OVERLAP_RATIO = 0.5
     FRAME_REMOVE_INNERMOST_MIN_INTERIOR_COUNT = 2
+    FRAME_KEEP_INNERMOST_MIN_EDGE_CONTACTS = 1
     FRAME_OUTER_WRAPPER_MIN_AREA_RATIO = 0.4
     FRAME_OUTER_EDGE_TOLERANCE_RATIO = 0.03
     FRAME_ALLOWED_STRAY_CONTACTS = 5
@@ -72,7 +76,12 @@ class DXFPreprocessor:
     def __init__(self, parser: DXFParser):
         self.parser = parser
 
-    def preprocess(self, parsed: ParsedDXF) -> PreprocessedDXF:
+    def preprocess(
+        self,
+        parsed: ParsedDXF,
+        *,
+        run_isolated_segment_cleanup: bool = False,
+    ) -> PreprocessedDXF:
         flattened_entities = parsed.flattened_entities
         if not flattened_entities:
             return PreprocessedDXF(
@@ -117,6 +126,11 @@ class DXFPreprocessor:
             if dxftype in self.parser.FORCED_DELETE_TYPES:
                 removed_ids.add(index)
                 removed_by_type.add(index)
+                continue
+
+            if self._should_force_remove_layer(flattened.effective_layer):
+                removed_ids.add(index)
+                removed_by_annotation.add(index)
                 continue
 
             if self._should_remove_annotation_geometry(
@@ -166,6 +180,16 @@ class DXFPreprocessor:
             frame_window_meta["outer_wrapper_indices"] = outer_wrapper_indices
             frame_window_meta["frame_chain_indices"].update(outer_wrapper_indices)
 
+            enclosing_frame_indices, enclosing_frame_bboxes = self._collect_enclosing_work_area_frames(
+                structural_geometry,
+                work_area_bbox,
+                frame_window_meta,
+                drawing_bbox,
+            )
+            frame_window_meta["enclosing_frame_bboxes"] = enclosing_frame_bboxes
+            frame_window_meta["enclosing_frame_indices"] = enclosing_frame_indices
+            frame_window_meta["frame_chain_indices"].update(enclosing_frame_indices)
+
             for index, flattened in geometry_candidates:
                 if index in removed_ids:
                     continue
@@ -180,6 +204,7 @@ class DXFPreprocessor:
                     and (
                         self._is_protected_boundary_layer(flattened.effective_layer)
                         or frame_window_meta.get("innermost_interior_count", 0) < self.FRAME_REMOVE_INNERMOST_MIN_INTERIOR_COUNT
+                        or frame_window_meta.get("innermost_edge_contact_count", 0) >= self.FRAME_KEEP_INNERMOST_MIN_EDGE_CONTACTS
                     )
                 ):
                     continue
@@ -217,7 +242,11 @@ class DXFPreprocessor:
 
         removed_by_border_frame: Set[int] = set()
         border_frame_bbox = frame_window_meta.get("outermost_frame_bbox")
-        border_frame_bboxes = frame_window_meta.get("chain_bboxes", []) + frame_window_meta.get("outer_wrapper_bboxes", [])
+        border_frame_bboxes = (
+            frame_window_meta.get("chain_bboxes", [])
+            + frame_window_meta.get("outer_wrapper_bboxes", [])
+            + frame_window_meta.get("enclosing_frame_bboxes", [])
+        )
         if removed_by_frame_window:
             removed_by_border_frame.update(
                 set(frame_window_meta.get("frame_chain_indices", set())) & removed_by_frame_window
@@ -233,7 +262,7 @@ class DXFPreprocessor:
             removed_ids.add(index)
 
         removed_ids.update(deferred_annotation_ids)
-        removed_by_annotation = set(deferred_annotation_ids)
+        removed_by_annotation.update(deferred_annotation_ids)
 
         segments: List[Segment] = []
         for index, flattened in geometry_candidates:
@@ -242,7 +271,10 @@ class DXFPreprocessor:
             segments.extend(self.parser._process_flattened_entity(flattened))
 
         segments, short_segment_meta = self.parser._remove_short_segments(segments, drawing_bbox)
-        segments, isolation_meta = self.parser._remove_isolated_segments(segments, drawing_bbox)
+        if run_isolated_segment_cleanup:
+            segments, isolation_meta = self.parser._remove_isolated_segments(segments, drawing_bbox)
+        else:
+            isolation_meta = {"removed_segments": 0, "removed_components": 0}
         bbox = self.parser._calculate_bbox(segments)
 
         preprocessing = {
@@ -260,6 +292,7 @@ class DXFPreprocessor:
             "removed_short_segments": short_segment_meta["removed_segments"],
             "removed_isolated_segments": isolation_meta["removed_segments"],
             "removed_isolated_components": isolation_meta["removed_components"],
+            "isolated_segment_cleanup_deferred": not run_isolated_segment_cleanup,
             "short_segment_threshold_mm": short_segment_meta["threshold"],
             "title_block_candidate_bbox": title_block_candidate_bbox,
             "title_block_bbox": title_block_bbox,
@@ -362,10 +395,21 @@ class DXFPreprocessor:
             chain_indices.update(candidate["indices"])
 
         innermost = selected_chain[-1]
+        enclosing_frame_indices = self._collect_covering_frame_indices(
+            candidates,
+            innermost["bbox"],
+            drawing_bbox,
+        )
         innermost_interior_count = self._count_entities_inside_bbox(
             geometry_entities,
             innermost["bbox"],
-            exclude_indices=set().union(*(candidate["indices"] for candidate in selected_chain)),
+            exclude_indices=chain_indices | enclosing_frame_indices,
+        )
+        innermost_edge_contact_count = self._count_entities_touching_bbox_boundary(
+            geometry_entities,
+            innermost["bbox"],
+            exclude_indices=chain_indices | enclosing_frame_indices,
+            tolerance=tolerance,
         )
         return innermost["bbox"], {
             "candidate_count": len(candidates),
@@ -378,9 +422,32 @@ class DXFPreprocessor:
             "frame_chain_indices": chain_indices,
             "innermost_frame_indices": set(innermost["indices"]),
             "innermost_interior_count": innermost_interior_count,
+            "innermost_edge_contact_count": innermost_edge_contact_count,
             "fallback_to_drawing_bbox": False,
             "reason": "selected_valid_chain",
         }
+
+    def _collect_covering_frame_indices(
+        self,
+        candidates: List[Dict[str, Any]],
+        target_bbox: Dict[str, float],
+        drawing_bbox: Dict[str, float],
+    ) -> Set[int]:
+        covering_indices: Set[int] = set()
+        target_area = self._bbox_area(target_bbox)
+        if target_area <= 0:
+            return covering_indices
+
+        for candidate in candidates:
+            if candidate["area"] <= target_area:
+                continue
+            if not self._bbox_contains_bbox(candidate["bbox"], target_bbox, margin=1.0):
+                continue
+            if not self._has_similar_center(candidate["bbox"], target_bbox, drawing_bbox):
+                continue
+            covering_indices.update(candidate["indices"])
+
+        return covering_indices
 
     def _collect_outer_wrapper_frames(
         self,
@@ -422,6 +489,42 @@ class DXFPreprocessor:
             wrapper_bboxes.append(candidate["bbox"])
 
         return wrapper_indices, wrapper_bboxes
+
+    def _collect_enclosing_work_area_frames(
+        self,
+        geometry_entities: List[Tuple[int, FlattenedEntity]],
+        work_area_bbox: Dict[str, float],
+        frame_window_meta: Dict[str, Any],
+        drawing_bbox: Dict[str, float],
+    ) -> Tuple[Set[int], List[Dict[str, float]]]:
+        if frame_window_meta.get("fallback_to_drawing_bbox"):
+            return set(), []
+
+        known_indices = set(frame_window_meta.get("frame_chain_indices", set()))
+        work_area = self._bbox_area(work_area_bbox)
+        if work_area <= 0:
+            return set(), []
+
+        enclosing_candidates = []
+        for candidate in self._collect_frame_rectangle_candidates(geometry_entities):
+            if candidate["indices"] & known_indices:
+                continue
+            if candidate["area"] <= work_area:
+                continue
+            if not self._bbox_contains_bbox(candidate["bbox"], work_area_bbox, margin=1.0):
+                continue
+            if not self._has_similar_center(candidate["bbox"], work_area_bbox, drawing_bbox):
+                continue
+            enclosing_candidates.append(candidate)
+
+        enclosing_candidates.sort(key=lambda item: item["area"], reverse=True)
+        enclosing_indices: Set[int] = set()
+        enclosing_bboxes: List[Dict[str, float]] = []
+        for candidate in enclosing_candidates:
+            enclosing_indices.update(candidate["indices"])
+            enclosing_bboxes.append(candidate["bbox"])
+
+        return enclosing_indices, enclosing_bboxes
 
     def _collect_frame_like_candidates(
         self,
@@ -731,6 +834,27 @@ class DXFPreprocessor:
                     break
 
         return len(contact_indices)
+
+    def _count_entities_touching_bbox_boundary(
+        self,
+        geometry_entities: List[Tuple[int, FlattenedEntity]],
+        bbox: Dict[str, float],
+        exclude_indices: Set[int],
+        tolerance: float,
+    ) -> int:
+        entity_bboxes = {
+            index: self._entity_bbox_dict(flattened)
+            for index, flattened in geometry_entities
+        }
+        line_cache: Dict[int, List[LineString]] = {}
+        return self._count_rectangle_boundary_contacts_excluding_candidates(
+            candidate_indices=exclude_indices,
+            candidate_bbox=bbox,
+            geometry_entities=geometry_entities,
+            entity_bboxes=entity_bboxes,
+            line_cache=line_cache,
+            tolerance=tolerance,
+        )
 
     def _is_frame_seed_bbox(
         self,
@@ -1577,6 +1701,11 @@ class DXFPreprocessor:
 
     def _is_protected_boundary_layer(self, layer_name: str | None) -> bool:
         return self._matches_keyword_group(layer_name, self.PROTECTED_BOUNDARY_LAYER_KEYWORDS)
+
+    def _should_force_remove_layer(self, layer_name: str | None) -> bool:
+        if self._is_protected_boundary_layer(layer_name):
+            return False
+        return self._matches_keyword_group(layer_name, self.FORCED_DELETE_LAYER_KEYWORDS)
 
     def _is_title_block_helper_entity(
         self,

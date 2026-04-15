@@ -31,6 +31,8 @@ class GraphMetrics:
     max_degree: int
     pruned_edges: int
     pruned_percent: float
+    removed_small_components: int = 0
+    removed_small_component_edges: int = 0
 
 
 class GraphProcessor:
@@ -206,6 +208,8 @@ class GraphProcessor:
             if iteration % 100 == 0:
                 logger.debug(f"Pruning iteration {iteration}: {len(dangling_nodes)} nodes removed")
 
+        removed_small_components, removed_component_edges = self._prune_small_disconnected_components()
+
         # Calculate metrics
         final_edges = self.graph.number_of_edges()
         final_nodes = self.graph.number_of_nodes()
@@ -223,6 +227,12 @@ class GraphProcessor:
             f"Pruning complete: {iteration} iterations, "
             f"{pruned_edges} edges removed ({pruned_percent:.1f}%)"
         )
+        if removed_small_components:
+            logger.info(
+                "Removed %d disconnected small components (%d edges)",
+                removed_small_components,
+                removed_component_edges,
+            )
 
         # Graph metrics
         components = nx.number_connected_components(self.graph)
@@ -234,7 +244,9 @@ class GraphProcessor:
             components=components,
             max_degree=max_degree,
             pruned_edges=pruned_edges,
-            pruned_percent=pruned_percent
+            pruned_percent=pruned_percent,
+            removed_small_components=removed_small_components,
+            removed_small_component_edges=removed_component_edges,
         )
 
         logger.info(
@@ -243,6 +255,63 @@ class GraphProcessor:
         )
 
         return metrics
+
+    def _prune_small_disconnected_components(self) -> Tuple[int, int]:
+        """
+        Remove tiny components far from the graph centroid.
+
+        This mirrors the old segment-level isolated-detail cleanup, but runs on
+        the already-snapped graph where connected components are cheap to inspect.
+        """
+        if self.graph is None or self.graph.number_of_edges() == 0:
+            return 0, 0
+
+        total_edges = self.graph.number_of_edges()
+        if total_edges <= 1:
+            return 0, 0
+
+        diagonal = math.hypot(
+            self.bbox["maxX"] - self.bbox["minX"],
+            self.bbox["maxY"] - self.bbox["minY"],
+        )
+        max_component_edges = max(3, int(total_edges * 0.08))
+
+        edge_midpoints = np.array([
+            ((start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0)
+            for start, end in self.graph.edges
+        ])
+        drawing_centroid = edge_midpoints.mean(axis=0)
+
+        nodes_to_remove: Set[Tuple[float, float]] = set()
+        removed_components = 0
+        removed_edges = 0
+
+        for component_nodes in nx.connected_components(self.graph):
+            subgraph = self.graph.subgraph(component_nodes)
+            component_edges = list(subgraph.edges)
+            if not component_edges:
+                continue
+            if len(component_edges) > max_component_edges:
+                continue
+
+            component_midpoints = np.array([
+                ((start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0)
+                for start, end in component_edges
+            ])
+            component_centroid = component_midpoints.mean(axis=0)
+            distance = float(np.linalg.norm(component_centroid - drawing_centroid))
+            if distance <= diagonal * 0.45:
+                continue
+
+            nodes_to_remove.update(component_nodes)
+            removed_components += 1
+            removed_edges += len(component_edges)
+
+        if not nodes_to_remove or removed_edges >= total_edges:
+            return 0, 0
+
+        self.graph.remove_nodes_from(nodes_to_remove)
+        return removed_components, removed_edges
 
     def get_active_segments(self, segments: List[Segment]) -> List[Segment]:
         """
