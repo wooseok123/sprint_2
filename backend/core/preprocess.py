@@ -10,7 +10,8 @@ import math
 from typing import Any, Dict, List, Set, Tuple
 
 import numpy as np
-from shapely.geometry import LineString
+from shapely.geometry import LineString, Point as ShapelyPoint, box
+from shapely.strtree import STRtree
 
 from core.parser import DXFParser, FlattenedEntity, ParsedDXF, Segment
 
@@ -72,6 +73,9 @@ class DXFPreprocessor:
     FRAME_OUTER_WRAPPER_MIN_AREA_RATIO = 0.4
     FRAME_OUTER_EDGE_TOLERANCE_RATIO = 0.03
     FRAME_ALLOWED_STRAY_CONTACTS = 5
+    FLOATING_SEGMENT_CONTACT_TOLERANCE_RATIO = 0.001
+    FLOATING_SEGMENT_MIN_CONTACT_TOLERANCE_MM = 1.0
+    FLOATING_SEGMENT_MAX_LENGTH_MULTIPLIER = 2.0
 
     def __init__(self, parser: DXFParser):
         self.parser = parser
@@ -96,6 +100,7 @@ class DXFPreprocessor:
                     "removed_by_title_block": 0,
                     "removed_by_border_frame": 0,
                     "removed_detached_rectangles": 0,
+                    "removed_floating_segments": 0,
                     "removed_short_segments": 0,
                     "removed_isolated_segments": 0,
                 },
@@ -163,6 +168,17 @@ class DXFPreprocessor:
             (index, flattened)
             for index, flattened in geometry_candidates
             if index not in removed_ids and index not in deferred_annotation_ids
+        ]
+        floating_segment_indices, floating_segment_meta = self._remove_floating_single_segment_entities(
+            structural_geometry,
+            drawing_bbox,
+            short_line_threshold=short_line_threshold,
+        )
+        removed_ids.update(floating_segment_indices)
+        structural_geometry = [
+            (index, flattened)
+            for index, flattened in structural_geometry
+            if index not in floating_segment_indices
         ]
         work_area_bbox, frame_window_meta = self._resolve_work_area_bbox(
             structural_geometry,
@@ -289,6 +305,8 @@ class DXFPreprocessor:
             "removed_by_border_frame": len(removed_by_border_frame),
             "removed_by_frame_window": len(removed_by_frame_window),
             "removed_detached_rectangles": len(detached_rectangle_indices),
+            "removed_floating_segments": floating_segment_meta["removed_segments"],
+            "floating_segment_cleanup_tolerance_mm": floating_segment_meta["tolerance"],
             "removed_short_segments": short_segment_meta["removed_segments"],
             "removed_isolated_segments": isolation_meta["removed_segments"],
             "removed_isolated_components": isolation_meta["removed_components"],
@@ -311,6 +329,105 @@ class DXFPreprocessor:
             bbox=bbox,
             preprocessing=preprocessing,
         )
+
+    def _remove_floating_single_segment_entities(
+        self,
+        geometry_entities: List[Tuple[int, FlattenedEntity]],
+        drawing_bbox: Dict[str, float],
+        *,
+        short_line_threshold: float,
+    ) -> Tuple[Set[int], Dict[str, Any]]:
+        """
+        Remove single-segment entities whose both endpoints do not touch any
+        other geometry before frame-based filtering runs.
+        """
+        segment_records: List[Tuple[int, LineString]] = []
+        entity_segment_counts: Dict[int, int] = {}
+
+        for index, flattened in geometry_entities:
+            lines: List[LineString] = []
+            for segment in self.parser._process_flattened_entity(flattened):
+                start = segment.start.to_2d()
+                end = segment.end.to_2d()
+                if start == end:
+                    continue
+                lines.append(LineString([start, end]))
+
+            if not lines:
+                continue
+
+            entity_segment_counts[index] = len(lines)
+            for line in lines:
+                segment_records.append((index, line))
+
+        if len(segment_records) < 2:
+            return set(), {"removed_segments": 0, "tolerance": 0.0}
+
+        diagonal = math.hypot(
+            drawing_bbox["maxX"] - drawing_bbox["minX"],
+            drawing_bbox["maxY"] - drawing_bbox["minY"],
+        )
+        tolerance = max(
+            diagonal * self.FLOATING_SEGMENT_CONTACT_TOLERANCE_RATIO,
+            self.FLOATING_SEGMENT_MIN_CONTACT_TOLERANCE_MM,
+        )
+        max_length = max(
+            short_line_threshold * self.FLOATING_SEGMENT_MAX_LENGTH_MULTIPLIER,
+            tolerance * 2.0,
+        )
+
+        lines = [line for _, line in segment_records]
+        line_tree = STRtree(lines)
+        removed_indices: Set[int] = set()
+        removed_segments = 0
+
+        for record_index, (entity_index, line) in enumerate(segment_records):
+            if entity_segment_counts.get(entity_index) != 1:
+                continue
+            if line.length > max_length:
+                continue
+
+            coords = list(line.coords)
+            if len(coords) < 2:
+                continue
+
+            if self._endpoint_touches_other_geometry(record_index, coords[0], lines, line_tree, tolerance):
+                continue
+            if self._endpoint_touches_other_geometry(record_index, coords[-1], lines, line_tree, tolerance):
+                continue
+
+            removed_indices.add(entity_index)
+            removed_segments += 1
+
+        return removed_indices, {
+            "removed_segments": removed_segments,
+            "tolerance": tolerance,
+        }
+
+    def _endpoint_touches_other_geometry(
+        self,
+        source_index: int,
+        endpoint: Tuple[float, float],
+        lines: List[LineString],
+        line_tree: STRtree,
+        tolerance: float,
+    ) -> bool:
+        query_bounds = box(
+            endpoint[0] - tolerance,
+            endpoint[1] - tolerance,
+            endpoint[0] + tolerance,
+            endpoint[1] + tolerance,
+        )
+        point = ShapelyPoint(endpoint)
+
+        for candidate_index in line_tree.query(query_bounds):
+            candidate_index = int(candidate_index)
+            if candidate_index == source_index:
+                continue
+            if lines[candidate_index].distance(point) <= tolerance:
+                return True
+
+        return False
 
     def _resolve_work_area_bbox(
         self,

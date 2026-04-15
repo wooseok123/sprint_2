@@ -1,0 +1,138 @@
+{
+  "dxf_path": "/Users/wooseoking/dev/sprint_3/asset/ha3.dxf",
+  "graph_pruning": {
+    "pruned_edges": 183,
+    "pruned_percent": 2.0214293604330056,
+    "components": 153,
+    "max_degree": 21,
+    "removed_small_components": 0,
+    "removed_small_component_edges": 0,
+    "outline_input_segments": 8870
+  },
+  "outline_extraction": {
+    "method": "outline_v2",
+    "buffer_radius": 24.99999998136991,
+    "estimated_wall_thickness": 49.99999996273982,
+    "estimate_method": "orthogonal_connectors",
+    "estimate_candidates": 1074,
+    "merged_area": 100692783.00507553,
+    "result_area": 803497367.1030676,
+    "concave_hull_fallback": false,
+    "erosion_radius": 12.499999990684955,
+    "erosion_retried": true,
+    "footprint_parts": 107,
+    "footprint_holes": 1,
+    "opening_attempted": true,
+    "opening_applied": false,
+    "opening_radius": 18.749999986027433,
+    "opening_area_ratio": 0.9997383019191265,
+    "opening_bbox_ratio": 0.8215111286425805,
+    "opening_hole_delta": 0,
+    "opening_hull_ratio_delta": 0.08391007429999742,
+    "opening_rollback_reasons": [
+      "bbox_drop_exceeded",
+      "hull_ratio_delta_exceeded"
+    ],
+    "closing_attempted": true,
+    "closing_applied": true,
+    "closing_radius": 18.749999986027433,
+    "closing_area_ratio": 1.0000392014782657,
+    "closing_bbox_ratio": 1.0,
+    "closing_hole_delta": 0,
+    "closing_hull_ratio_delta": 3.155865131654334e-05,
+    "closing_rollback_reasons": [],
+    "bridge_attempted": false,
+    "bridge_candidates": 0,
+    "bridge_applied_count": 0,
+    "bridge_rollback_reasons": [],
+    "bridge_logs": [],
+    "bridge_last_candidate": null,
+    "bridge_last_candidate_source": null,
+    "bridge_last_candidate_bounds": null,
+    "bridge_last_candidate_metrics": null,
+    "bridge_cv_fallback_recommended": false,
+    "bridge_cv_fallback_trigger_reasons": []
+  },
+  "cv_attempts": [],
+  "vision_candidates": [
+    {
+      "index": 0,
+      "kind": "thin_feature",
+      "source": "opening_delta",
+      "bounds": [
+        85312.749886,
+        36921.640933,
+        85337.749886,
+        41421.640933
+      ],
+      "image_path": "/Users/wooseoking/dev/sprint_3/backend/tmp/vision_probe_ha3/candidate_00_thin_feature.png",
+      "render": {
+        "roi_bounds": [
+          85192.74988608943,
+          36801.640933089424,
+          85457.74988591058,
+          41541.64093291058
+        ],
+        "roi_segment_count": 2,
+        "resolution_mm_per_px": 6.583333333084941,
+        "width_px": 160,
+        "height_px": 732
+      }
+    },
+    {
+      "index": 1,
+      "kind": "thin_feature",
+      "source": "opening_delta",
+      "bounds": [
+        76219.44261,
+        15685.297674999998,
+        77062.749886,
+        15710.297675000002
+      ],
+      "image_path": "/Users/wooseoking/dev/sprint_3/backend/tmp/vision_probe_ha3/candidate_01_thin_feature.png",
+      "render": {
+        "roi_bounds": [
+          76099.44261008942,
+          15565.297675089423,
+          77182.74988591058,
+          15830.297674910576
+        ],
+        "roi_segment_count": 2,
+        "resolution_mm_per_px": 1.5045934386405053,
+        "width_px": 732,
+        "height_px": 189
+      }
+    },
+    {
+      "index": 2,
+      "kind": "thin_feature",
+      "source": "opening_delta",
+      "bounds": [
+        108087.749886,
+        18685.209125,
+        108931.057162,
+        18710.209125
+      ],
+      "image_path": "/Users/wooseoking/dev/sprint_3/backend/tmp/vision_probe_ha3/candidate_02_thin_feature.png",
+      "render": {
+        "roi_bounds": [
+          107967.74988608943,
+          18565.209125089426,
+          109051.05716191058,
+          18830.209124910576
+        ],
+        "roi_segment_count": 2,
+        "resolution_mm_per_px": 1.5045934386404851,
+        "width_px": 732,
+        "height_px": 189
+      }
+    }
+  ],
+  "gemini_cleanup": null,
+  "validated_boundary": {
+    "is_valid": true,
+    "vertex_count": 17,
+    "area": 803497367.1030185,
+    "confidence": 1.0
+  }
+}

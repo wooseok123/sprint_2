@@ -5,6 +5,7 @@ import os
 import tempfile
 
 import ezdxf
+from ezdxf.math import Matrix44
 
 from core.parser import DXFParser
 
@@ -54,6 +55,43 @@ class TestDXFParserRawExtraction:
         assert round(segment.start.y, 6) == 100.0
         assert round(segment.end.x, 6) == 105.0
         assert round(segment.end.y, 6) == 110.0
+
+    def test_parse_skips_geometry_outside_spatially_clipped_insert(self):
+        doc = self._new_doc()
+        clip_block = doc.blocks.new(name="CLIP_BLOCK")
+        clip_block.add_line((0, 0), (10, 0))
+        clip_block.add_line((20, 0), (30, 0))
+
+        insert = doc.modelspace().add_blockref("CLIP_BLOCK", (100, 200))
+        self._attach_spatial_clip(insert, [(99, 199), (111, 199), (111, 201), (99, 201)])
+
+        parsed = self._parse_document(doc)
+
+        assert parsed.entity_count == 1
+        assert len(parsed.segments) == 1
+        assert parsed.bbox == {
+            "minX": 100.0,
+            "minY": 200.0,
+            "maxX": 110.0,
+            "maxY": 200.0,
+        }
+
+    def test_parse_clips_geometry_crossing_spatially_clipped_insert_boundary(self):
+        doc = self._new_doc()
+        clip_block = doc.blocks.new(name="PARTIAL_CLIP_BLOCK")
+        clip_block.add_line((0, 0), (20, 0))
+
+        insert = doc.modelspace().add_blockref("PARTIAL_CLIP_BLOCK", (100, 200))
+        self._attach_spatial_clip(insert, [(100, 199), (110, 199), (110, 201), (100, 201)])
+
+        parsed = self._parse_document(doc)
+
+        assert len(parsed.segments) == 1
+        segment = parsed.segments[0]
+        assert segment.start.x == 100.0
+        assert segment.start.y == 200.0
+        assert segment.end.x == 110.0
+        assert segment.end.y == 200.0
 
     def test_parse_skips_entities_on_off_layers(self):
         doc = self._new_doc()
@@ -211,3 +249,18 @@ class TestDXFParserRawExtraction:
             return parser.parse()
         finally:
             os.unlink(temp_path)
+
+    def _attach_spatial_clip(self, insert, boundary_vertices):
+        extension_dict = insert.new_extension_dict()
+        acad_filter = insert.doc.objects.add_dictionary(owner=extension_dict.dictionary.dxf.handle, hard_owned=True)
+        extension_dict["ACAD_FILTER"] = acad_filter
+
+        spatial_filter = insert.doc.objects.new_entity("SPATIAL_FILTER", dxfattribs={"owner": acad_filter.dxf.handle})
+        spatial_filter.set_boundary_vertices(boundary_vertices)
+
+        inverse_insert_matrix = insert.matrix44()
+        inverse_insert_matrix.inverse()
+        spatial_filter.set_inverse_insert_matrix(inverse_insert_matrix)
+        spatial_filter.set_transform_matrix(Matrix44())
+
+        acad_filter["SPATIAL"] = spatial_filter

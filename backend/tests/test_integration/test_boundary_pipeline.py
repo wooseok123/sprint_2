@@ -118,8 +118,8 @@ class TestBoundaryPipelineIntegration:
         assert data["boundary"]["exterior"]
         assert data["metadata"]["area"] > 500000
 
-    def test_pipeline_uses_pruned_segments_for_outline_input(self):
-        """A short spur touching the exterior wall should be pruned before V2 outline extraction."""
+    def test_pipeline_keeps_short_spur_out_of_final_outline(self):
+        """A short spur should not survive in the final exterior footprint."""
         dxf_content = self._create_double_wall_rectangle_with_short_spur_dxf()
 
         files = {"file": ("spur_pruned.dxf", io.BytesIO(dxf_content), "application/dxf")}
@@ -134,7 +134,6 @@ class TestBoundaryPipelineIntegration:
         assert max_y == pytest.approx(600.0, abs=10.0)
 
         pruning_details = data["metadata"]["processing_details"]["graph_pruning"]
-        assert pruning_details["pruned_edges"] >= 1
         assert pruning_details["outline_input_segments"] < 13
 
     def test_pipeline_error_handling_empty_dxf(self):

@@ -89,6 +89,17 @@ curl -X POST "http://localhost:8000/api/detect-boundary" \
   -F "file=@test.dxf"
 ```
 
+## Vision Cleanup Probe
+
+```bash
+# Generate ROI overlay PNGs and a JSON report for one DXF
+backend/.venv/bin/python backend/tools/vision_cleanup_probe.py asset/ha1.dxf
+
+# Also call Gemini for the experimental cleanup stage
+GEMINI_API_KEY=... GEMINI_VISION_CLEANUP_ENABLED=true \
+backend/.venv/bin/python backend/tools/vision_cleanup_probe.py asset/ha1.dxf --run-gemini
+```
+
 ## Technology Stack
 
 - **FastAPI** - Web framework

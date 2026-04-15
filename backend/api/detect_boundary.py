@@ -216,6 +216,7 @@ async def detect_boundary(file: UploadFile = File(...)):
                 apply_cv_door_fallback,
                 collect_cv_candidate_bounds,
             )
+            from core.vision_cleanup import maybe_apply_gemini_vision_cleanup
             from core.union import BoundaryExtractor
             from core.validate import BoundaryValidator
 
@@ -413,6 +414,14 @@ async def detect_boundary(file: UploadFile = File(...)):
                     cv_fallback_metadata["detection_reason"] = "trigger_not_met"
 
                 merge_metadata["cv_fallback"] = cv_fallback_metadata
+
+                merged_polygon, vision_cleanup_metadata = maybe_apply_gemini_vision_cleanup(
+                    polygon=merged_polygon,
+                    reference_segments=preprocessed.segments,
+                    wall_thickness=merge_metadata.get("estimated_wall_thickness", 0.0),
+                    preferred_bounds=preferred_bounds,
+                )
+                merge_metadata["vision_cleanup"] = vision_cleanup_metadata
 
             # STEP 9: Validation
             logger.info("STEP 9: Validating boundary...")
