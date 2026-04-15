@@ -247,6 +247,10 @@ def test_outline_v2_bridge_removes_large_door_sized_protrusion():
     assert cleaned.bounds[2] == pytest.approx(1000.0, abs=2.0)
     assert metadata["bridge_applied_count"] == 1
     assert metadata["bridge_rollback_reasons"] == []
+    assert metadata["bridge_last_candidate"] is not None
+    assert metadata["bridge_last_candidate_bounds"] is not None
+    assert metadata["bridge_last_candidate_metrics"]["span_ratio"] > 0
+    assert metadata["bridge_cv_fallback_recommended"] is False
 
 
 def test_outline_v2_bridge_skips_legitimate_l_shape():
@@ -257,3 +261,27 @@ def test_outline_v2_bridge_skips_legitimate_l_shape():
 
     assert cleaned.equals(polygon)
     assert metadata["bridge_applied_count"] == 0
+
+
+def test_outline_v2_bridge_cv_fallback_trigger_requires_curved_failed_candidate():
+    extractor = OutlineExtractorV2()
+
+    should_recommend, reasons = extractor._should_recommend_cv_bridge_fallback({
+        "bridge_attempted": True,
+        "bridge_applied_count": 0,
+        "bridge_last_candidate_source": "curved",
+        "bridge_rollback_reasons": ["bbox_drop_exceeded", "hole_count_changed"],
+    })
+
+    assert should_recommend is True
+    assert reasons == ["bbox_drop_exceeded"]
+
+    should_recommend, reasons = extractor._should_recommend_cv_bridge_fallback({
+        "bridge_attempted": True,
+        "bridge_applied_count": 1,
+        "bridge_last_candidate_source": "curved",
+        "bridge_rollback_reasons": ["bbox_drop_exceeded"],
+    })
+
+    assert should_recommend is False
+    assert reasons == []

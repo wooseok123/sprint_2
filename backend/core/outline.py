@@ -523,6 +523,12 @@ class OutlineExtractorV2:
             "bridge_applied_count": 0,
             "bridge_rollback_reasons": [],
             "bridge_logs": [],
+            "bridge_last_candidate": None,
+            "bridge_last_candidate_source": None,
+            "bridge_last_candidate_bounds": None,
+            "bridge_last_candidate_metrics": None,
+            "bridge_cv_fallback_recommended": False,
+            "bridge_cv_fallback_trigger_reasons": [],
         }
 
         if polygon is None or polygon.is_empty or wall_thickness <= 0:
@@ -541,6 +547,11 @@ class OutlineExtractorV2:
 
             metadata["bridge_attempted"] = True
             metadata["bridge_candidates"] += 1
+            candidate_snapshot = self._bridge_candidate_snapshot(current, candidate)
+            metadata["bridge_last_candidate"] = candidate_snapshot
+            metadata["bridge_last_candidate_source"] = candidate_snapshot["source"]
+            metadata["bridge_last_candidate_bounds"] = candidate_snapshot["bounds"]
+            metadata["bridge_last_candidate_metrics"] = candidate_snapshot["metrics"]
             candidate_log = (
                 f"source={candidate.get('source', 'unknown')} "
                 f"start={candidate['start']} end={candidate['end']} "
@@ -584,6 +595,9 @@ class OutlineExtractorV2:
         metadata["bridge_applied_count"] = applied
         metadata["bridge_rollback_reasons"] = rollback_reasons
         metadata["bridge_logs"] = bridge_logs
+        should_recommend_cv, trigger_reasons = self._should_recommend_cv_bridge_fallback(metadata)
+        metadata["bridge_cv_fallback_recommended"] = should_recommend_cv
+        metadata["bridge_cv_fallback_trigger_reasons"] = trigger_reasons
         if applied:
             logger.info("Applied %d polygon bridges: %s", applied, "; ".join(bridge_logs[:5]))
         elif rollback_reasons:
@@ -1031,6 +1045,51 @@ class OutlineExtractorV2:
 
     def _distance(self, left: Tuple[float, float], right: Tuple[float, float]) -> float:
         return math.hypot(right[0] - left[0], right[1] - left[1])
+
+    def _bridge_candidate_snapshot(self, polygon: Polygon, candidate: Dict) -> Dict:
+        coords = list(polygon.exterior.coords[:-1])
+        chain = self._slice_ring(coords, candidate["start"], candidate["end"])
+        bounds = self._coords_bounds(chain)
+        metrics = {
+            "span_ratio": float(candidate["span_ratio"]),
+            "path_ratio": float(candidate["path_ratio"]),
+            "deviation_ratio": float(candidate["deviation_ratio"]),
+            "area_ratio": float(candidate["area_ratio"]),
+            "turn_deg": float(candidate["turn_deg"]) if "turn_deg" in candidate else None,
+        }
+        return {
+            "start": int(candidate["start"]),
+            "end": int(candidate["end"]),
+            "source": candidate.get("source", "unknown"),
+            "bounds": bounds,
+            "metrics": metrics,
+        }
+
+    def _coords_bounds(self, coords: List[Tuple[float, float]]) -> Optional[List[float]]:
+        if not coords:
+            return None
+        xs = [point[0] for point in coords]
+        ys = [point[1] for point in coords]
+        return [min(xs), min(ys), max(xs), max(ys)]
+
+    def _should_recommend_cv_bridge_fallback(self, metadata: Dict) -> Tuple[bool, List[str]]:
+        if not metadata.get("bridge_attempted"):
+            return False, []
+        if metadata.get("bridge_applied_count", 0) != 0:
+            return False, []
+        if metadata.get("bridge_last_candidate_source") != "curved":
+            return False, []
+
+        allowed_reasons = {
+            "bbox_drop_exceeded",
+            "hull_ratio_delta_exceeded",
+            "invalid_bridge_geometry",
+        }
+        trigger_reasons = [
+            reason for reason in metadata.get("bridge_rollback_reasons", [])
+            if reason in allowed_reasons
+        ]
+        return bool(trigger_reasons), trigger_reasons
 
     def _point_line_distance(
         self,
